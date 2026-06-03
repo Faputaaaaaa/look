@@ -1,0 +1,90 @@
+# ============================================
+# GC10DET 缺陷检测项目 - Git忽略规则
+# 只保留核心代码，其余全部忽略
+# ============================================
+
+# --- 数据集（图片+标注，体积大） ---
+公开数据集GC10DET/
+
+# --- Python缓存 ---
+__pycache__/
+*.pyc
+*.pyo
+
+# --- 实验输出（图片、日志、结果） ---
+experiments/
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.txt
+*.log
+
+# --- 测试/诊断/分析/验证脚本（非核心） ---
+analysis_v3.py
+analyze_anchors.py
+analyze_chongkong_deep.py
+analyze_dataset.py
+analyze_predictions.py
+check_augmentation.py
+check_dataset.py
+check_dataset_v2.py
+check_mixed_defects.py
+clean_dataset.py
+count_chongkong.py
+deep_analysis.py
+detailed_analysis.py
+diagnose_chongkong.py
+diagnose_model.py
+diagnose_rpn_chongkong.py
+diagnose_small_target.py
+evidence_final.py
+evidence_v2.py
+explain_imbalance.py
+explain_simple.py
+explain_v2.py
+final_evidence.py
+find_compatible_model.py
+full_test_evidence.py
+full_test_evidence2.py
+get_evidence.py
+iou_analysis.py
+iou_simple.py
+kmeans_anchors.py
+kmeans_simple.py
+minimal_test.py
+prepare_gc10det.py
+quick_test.py
+rpn_inference.py
+run_evaluate.py
+sahi_integration.py
+simple_evidence.py
+smoke_test.py
+smoke_test_file.py
+test_anchor_config.py
+test_augmentation.py
+test_chongkong_features.py
+test_ck_simple.py
+test_output.py
+test_rpn.py
+test_simple_final.py
+verify_clean.py
+verify_hanfeng.py
+verify_rpn_diagnosis.py
+verify_simple.py
+visualize_labels.py
+
+# --- 旧版/备用文件 ---
+model.py
+train_fpn.py
+evaluate.py
+logger.py
+
+# --- IDE / 系统 ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
