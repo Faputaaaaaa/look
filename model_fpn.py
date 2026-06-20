@@ -183,12 +183,12 @@ class FPN(nn.Module):
 # ============================================================
 
 class AnchorGenerator:
-    """锚框生成器。
-    
-    配置（你选择的）:
-    - P2: 尺度[2,4,8], 宽高比[0.1,0.2,1.0,5.0,10.0] → 15个锚框/位置
-    - P3: 尺度[8,16,32], 宽高比[0.1,0.2,1.0,5.0,10.0] → 15个锚框/位置
-    - P4: 尺度[32,64,128], 宽高比[0.1,0.2,1.0,5.0,10.0] → 15个锚框/位置
+    """锚框生成器（K-means优化配置）。
+
+    配置:
+    - P2(stride=4): 尺度[16,24,32,48,64], 比率[0.5,1.0,2.0] → 15个锚框/位置
+    - P3(stride=8): 尺度[32,48,64,96,128], 比率[0.5,1.0,2.0] → 15个锚框/位置
+    - P4(stride=16): 尺度[64,128,192,256,384], 比率[0.5,1.0,2.0] → 15个锚框/位置
     """
     
     def __init__(self):
@@ -332,8 +332,9 @@ class RPN(nn.Module):
         for feat in fpn_features:
             x = F.relu(self.conv(feat))
             
-            # 分类 [B, 15, H, W]
-            cls_pred = torch.sigmoid(self.cls_conv(x))
+            # 分类 [B, 15, H, W] — 输出原始logits（不在此处sigmoid）
+            # 训练时直接送入BCEWithLogitsLoss，推理时再手动sigmoid
+            cls_pred = self.cls_conv(x)
             cls_preds.append(cls_pred)
             
             # 回归 [B, 60, H, W]
@@ -373,20 +374,22 @@ class ROIHead(nn.Module):
         self.fc2 = nn.Linear(1024, 1024)
         self.dropout2 = nn.Dropout(0.3)  # 添加dropout防止过拟合
         
-        # 分类头
-        self.cls_head = nn.Linear(1024, num_classes + 1)  # +1 for background
-        
-        # 回归头
-        self.bbox_head = nn.Linear(1024, num_classes * 4)
-    
+        # 分类头（含背景类：5前景类 + 1背景类 = 6维）
+        # 标准Faster R-CNN设计：softmax后类间竞争，BG提供"退出选项"
+        self.cls_head = nn.Linear(1024, num_classes + 1)
+
+        # 回归头（共享bbox回归，所有类别共用一组delta）
+        # 共享回归避免per-class delta选错导致的框膨胀问题
+        self.bbox_head = nn.Linear(1024, 16)
+
     def forward(self, roi_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             roi_features: [N, C, 7, 7] ROI池化后的特征
-        
+
         Returns:
-            cls_pred: [N, num_classes+1] 分类预测
-            bbox_pred: [N, num_classes*4] 边界框精修
+            cls_pred: [N, num_classes+1] 分类预测（索引0=背景, 1-5=前景）
+            bbox_pred: [N, 16] 边界框精修（共享回归，4组delta各4维）
         """
         x = roi_features.flatten(1)
         x = F.relu(self.fc1(x))
@@ -524,8 +527,7 @@ class TwoStageDetector(nn.Module):
         
         dx, dy, dw, dh = deltas[:, 0], deltas[:, 1], deltas[:, 2], deltas[:, 3]
         
-        # 收紧exp clamp：exp(3)=20倍足够覆盖正常回归范围
-        # 之前max=4.0导致exp(4)=54.6倍，配合大锚框产生超大误检框
+        # 恢复原始exp clamp范围（分类准确后不需要过度限制）
         pred_cx = dx * anchor_w + anchor_cx
         pred_cy = dy * anchor_h + anchor_cy
         pred_w = torch.exp(dw.clamp(min=-4.0, max=3.0)) * anchor_w
@@ -535,15 +537,16 @@ class TwoStageDetector(nn.Module):
         y1 = pred_cy - 0.5 * pred_h
         x2 = pred_cx + 0.5 * pred_w
         y2 = pred_cy + 0.5 * pred_h
-        
-        boxes = torch.stack([x1, y1, x2, y2], dim=1)
-        
+
         # 裁剪到图像边界（防止框飞出图像外）
+        # 注意：先clamp再stack，避免对计算图内tensor做inplace操作
         if img_w is not None and img_h is not None:
-            boxes[:, 0] = boxes[:, 0].clamp(min=0, max=img_w)
-            boxes[:, 1] = boxes[:, 1].clamp(min=0, max=img_h)
-            boxes[:, 2] = boxes[:, 2].clamp(min=0, max=img_w)
-            boxes[:, 3] = boxes[:, 3].clamp(min=0, max=img_h)
+            x1 = x1.clamp(min=0, max=img_w)
+            y1 = y1.clamp(min=0, max=img_h)
+            x2 = x2.clamp(min=0, max=img_w)
+            y2 = y2.clamp(min=0, max=img_h)
+
+        boxes = torch.stack([x1, y1, x2, y2], dim=1)
         
         return boxes
     
@@ -584,12 +587,25 @@ class TwoStageDetector(nn.Module):
                 anchors = anchors_dict[layer_name]
                 
                 cls_pred = rpn_cls_preds[i][b].flatten()
+                # RPN输出原始logits，推理时需要sigmoid转为概率
+                cls_pred = torch.sigmoid(cls_pred)
                 bbox_pred = rpn_bbox_preds[i][b].permute(1, 2, 0).contiguous()
                 bbox_pred = bbox_pred.reshape(-1, 15, 4)  # 5尺度×3比例=15个锚框
                 bbox_pred = bbox_pred.reshape(-1, 4)
                 
                 boxes = self.decode_boxes(anchors, bbox_pred, img_w=W, img_h=H)
-                
+
+                # 【关键修复】RPN objectness score 阈值过滤
+                # 未训练/随机权重的模型sigmoid输出约0.5-0.7，必须过滤掉低分anchor
+                # 否则所有top-K anchor都变成proposal → 网格状假检测
+                score_thresh = INFERENCE_CONFIG['rpn_score_thresh']
+                valid_mask = cls_pred > score_thresh
+                if valid_mask.sum() == 0:
+                    continue  # 该层无合格proposal，跳过
+
+                cls_pred = cls_pred[valid_mask]
+                boxes = boxes[valid_mask]
+
                 top_n = min(INFERENCE_CONFIG['rpn_pre_nms_top_n'], cls_pred.size(0))
                 top_scores, top_inds = cls_pred.topk(top_n)
                 top_boxes = boxes[top_inds]
@@ -605,6 +621,14 @@ class TwoStageDetector(nn.Module):
             if len(proposals) > 0:
                 proposals = torch.cat(proposals, dim=0)
                 proposal_scores = torch.cat(proposal_scores, dim=0)
+
+                # 全局NMS：消除跨层重复proposal（P2/P3/P4可能指向同一区域）
+                if proposals.size(0) > 0:
+                    keep = nms(proposals, proposal_scores, 0.7)
+                    # 保留最多600个跨层去重后的proposal
+                    keep = keep[:min(600, keep.size(0))]
+                    proposals = proposals[keep]
+                    proposal_scores = proposal_scores[keep]
             else:
                 all_boxes.append(torch.zeros(0, 4, device=device))
                 all_scores.append(torch.zeros(0, device=device))
@@ -666,20 +690,32 @@ class TwoStageDetector(nn.Module):
             roi_orig_indices = torch.cat(all_indices, dim=0)
             
             cls_logits, bbox_deltas = self.roi_head(roi_features)
+
+            # Softmax多分类（标准Faster R-CNN：含背景类，类间竞争）
+            # cls_logits: [N, num_classes+1] = [N, 6]，索引0=BG, 1-5=前景
             cls_probs = torch.softmax(cls_logits, dim=1)
-            
-            scores, labels = cls_probs[:, 1:].max(dim=1)
-            labels = labels + 1
-            
+            scores, cls_indices = cls_probs.max(dim=1)              # cls_indices: 0-5
+
+            # 共享bbox回归（所有类别共用前4个delta值）
+            selected_deltas = bbox_deltas[:, :4]
+
             # 应用ROI Head的bbox回归精修
-            refined_boxes = self.decode_boxes(proposals[roi_orig_indices], bbox_deltas, img_w=W, img_h=H)
-            
-            valid_mask = scores > INFERENCE_CONFIG['score_thresh']
-            if valid_mask.sum() == 0:
+            refined_boxes = self.decode_boxes(proposals[roi_orig_indices], selected_deltas, img_w=W, img_h=H)
+
+            # 过滤掉背景类预测（cls_index=0即BG），只保留前景
+            fg_mask = cls_indices > 0  # 前景cls_index: 1-5
+            if fg_mask.sum() == 0:
                 all_boxes.append(torch.zeros(0, 4, device=device))
                 all_scores.append(torch.zeros(0, device=device))
                 all_labels.append(torch.zeros(0, dtype=torch.long, device=device))
                 continue
+
+            refined_boxes = refined_boxes[fg_mask]
+            scores = scores[fg_mask]
+            # cls_index 1→label 1(chongkong), 2→2(shuiban), ..., 5→5(hanfeng)
+            labels = cls_indices[fg_mask]  # 直接用cls_index作为label (1-5)
+
+            valid_mask = scores > INFERENCE_CONFIG['score_thresh']
             
             final_boxes = refined_boxes[valid_mask]
             final_scores = scores[valid_mask]
@@ -733,10 +769,11 @@ FPN_CONFIG = {
 INFERENCE_CONFIG = {
     'rpn_pre_nms_top_n': 600,     # 每层NMS前取top600（标准Faster R-CNN值）
     'rpn_post_nms_top_n': 300,    # 每层NMS后保留300（3层共~900个proposal，合理范围）
-    'rpn_nms_thresh': 0.7,        # RPN NMS阈值（标准0.7，有效抑制重叠框）
-    'score_thresh': 0.05,         # ROI Head分类置信度阈值（初步过滤）
-    'nms_thresh': 0.5,            # 最终检测框NMS阈值
-    'max_detections': 100,        # 每张图最大检测数（给小目标留余量）
+    'rpn_nms_thresh': 0.6,        # RPN NMS阈值
+    'rpn_score_thresh': 0.25,     # RPN objectness门槛 (0.3→0.25: 降低以获取更多proposal)
+    'score_thresh': 0.25,         # ROI Head分类置信度阈值 (0.30→0.25: 快速验证是否有其他类别)
+    'nms_thresh': 0.5,            # 最终检测框NMS阈值 (0.45→0.5: 更严格去重)
+    'max_detections': 20,         # 每张图最大检测数 (15→20: 允许更多检测)
 }
 
 

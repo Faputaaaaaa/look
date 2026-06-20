@@ -1,0 +1,16 @@
+{
+  "timestamp": "2026-06-09T12:37:58.159074",
+  "processes": [
+    {
+      "pid": 30796,
+      "status": "unknown"
+    },
+    {
+      "pid": 6484,
+      "status": "unknown"
+    }
+  ],
+  "all_stopped": true,
+  "experiment_files_count": 1,
+  "experiment_exists": true
+}
