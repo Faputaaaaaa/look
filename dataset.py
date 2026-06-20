@@ -465,43 +465,80 @@ class DefectDataset(Dataset):
         img_w: int, 
         img_h: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
-        """直接缩放处理（包含数据增强和标注框同步）。
+        """Letterbox预处理（保持宽高比，消除形状畸变）。
         
-        关键改进：几何变换（如水平翻转）需要同步更新标注框坐标！
+        将原始图像按比例缩放到目标尺寸内，短边贴合，
+        长边空白区域用灰色(128)填充。bbox坐标同步变换。
         """
-        # 1. 准备原始标注框
+        # 1. 准备原始标注框（归一化坐标 cx,cy,w,h,class_id）
         bboxes = []
         for bbox in sample['all_bboxes']:
             bboxes.append([bbox['cx'], bbox['cy'], bbox['w'], bbox['h'], bbox['class_id']])
         num_objects = len(bboxes)
         
-        # 2. 缩放图像到目标尺寸
-        img_resized = img.resize((self.img_size, self.img_size))
+        # 2. Letterbox resize：保持宽高比
+        iw, ih = img.size  # 原始尺寸
+        w, h = self.img_size, self.img_size  # 目标尺寸(正方形)
+        scale = min(w / iw, h / ih)  # 缩放比例（取较小值保持比例）
+        nw, nh = int(iw * scale), int(ih * scale)  # 缩放后的实际尺寸
         
-        # 3. 【关键】手动处理几何增强 + 标注框同步
+        img_resized = img.resize((nw, nh), Image.BILINEAR)
+        
+        # 创建灰色画布并粘贴到中心
+        new_img = Image.new('RGB', (w, h), (128, 128, 128))
+        offset_x = (w - nw) // 2
+        offset_y = (h - nh) // 2
+        new_img.paste(img_resized, (offset_x, offset_y))
+        img_resized = new_img
+        
+        # 3. 同步变换bbox坐标（从原图归一化坐标 → letterbox后新归一化坐标）
+        if num_objects > 0:
+            for i in range(len(bboxes)):
+                cx, cy, bw, bh, cls_id = bboxes[i]
+                # 归一化坐标 → 原图像素坐标
+                cx_px = cx * iw
+                cy_px = cy * ih
+                bw_px = bw * iw
+                bh_px = bh * ih
+                # 应用scale和offset → 新像素坐标
+                new_cx_px = cx_px * scale + offset_x
+                new_cy_px = cy_px * scale + offset_y
+                new_bw_px = bw_px * scale
+                new_bh_px = bh_px * scale
+                # 重新归一化到目标尺寸
+                bboxes[i] = [
+                    new_cx_px / w,
+                    new_cy_px / h,
+                    new_bw_px / w,
+                    new_bh_px / h,
+                    cls_id
+                ]
+        
+        # 4. 数据增强（在letterbox后的正方形图上操作）
         if self.mode == 'train' and config.use_augmentation:
-            # 3.1 水平翻转（需要同步更新标注框的cx）
-            if random.random() < 0.5:  # p=0.5
+            # 4.1 水平翻转
+            if random.random() < 0.5:
                 img_resized = img_resized.transpose(Image.FLIP_LEFT_RIGHT)
-                # 同步翻转所有标注框: cx → 1 - cx
                 bboxes = [[1.0 - b[0], b[1], b[2], b[3], b[4]] for b in bboxes]
             
-            # 3.2 颜色增强（不影响位置，不需要同步标注框）
+            # 4.2 颜色增强
             if self.color_transform:
                 img_resized = self.color_transform(img_resized)
         
-        # 4. 转换为Tensor并归一化
+        # 5. 转换为Tensor并归一化
         if self.normalize_transform:
             img_tensor = self.normalize_transform(img_resized)
         else:
             img_tensor = transforms.ToTensor()(img_resized)
         
-        # 5. 填充标注框到固定大小
+        # 6. 填充标注框到固定大小
         bboxes_padded = self._pad_bboxes(bboxes)
         
         meta = {
             'img_path': sample['img_path'],
-            'original_size': (img_w, img_h)
+            'original_size': (img_w, img_h),
+            'letterbox_scale': scale,
+            'letterbox_offset': (offset_x, offset_y)
         }
         
         return img_tensor, torch.tensor(num_objects, dtype=torch.long), bboxes_padded, meta

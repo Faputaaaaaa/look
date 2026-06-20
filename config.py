@@ -49,7 +49,7 @@ class Config:
     
     # 模型参数
     img_size: int = 768              # 模型输入尺寸（回退到768以匹配现有训练权重）
-    batch_size: int = 2              # 批量大小（RTX 4060 8GB，保守配置）
+    batch_size: int = 1              # 批量大小（改为1以适应8GB显存限制）
     epochs: int = 50                 # 训练轮数
     learning_rate: float = 1e-4      # 学习率
     weight_decay: float = 1e-4       # 权重衰减
@@ -99,7 +99,7 @@ class Config:
     })
     
     # 最大目标数量（用于padding）
-    max_objects: int = 10
+    max_objects: int = 20  # 从10提升到20（覆盖youban类单张图13个目标的情况）
     
     # ============================================================
     # 训练参数
@@ -107,7 +107,7 @@ class Config:
     
     # 学习率调度
     lr_scheduler: str = "cosine"     # cosine / step / constant
-    warmup_epochs: int = 5           # 预热轮数
+    warmup_epochs: int = 2           # 预热轮数（从5降到2，避免占阶段1过大比例）
     
     # 数据增强
     use_augmentation: bool = True
