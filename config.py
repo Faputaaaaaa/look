@@ -48,7 +48,7 @@ class Config:
     # ============================================================
     
     # 模型参数
-    img_size: int = 768              # 模型输入尺寸（回退到768以匹配现有训练权重）
+    img_size: int = 640              # [R35] 640切片+640输入，无二次缩放
     batch_size: int = 1              # 批量大小（改为1以适应8GB显存限制）
     epochs: int = 50                 # 训练轮数
     learning_rate: float = 1e-4      # 学习率
@@ -62,12 +62,14 @@ class Config:
     # ============================================================
     
     # 原始图片尺寸（从数据集分析得到）
-    original_img_width: int = 2048   # 原图宽度
-    original_img_height: int = 1000  # 原图高度
+    # xinpaide: 4096 x 2736
+    original_img_width: int = 4096
+    original_img_height: int = 2736
     
     # 滑动窗口参数
-    window_size: int = 1024          # 窗口大小（建议：最大缺陷的2-3倍）
-    window_stride: int = 512         # 窗口步长（建议：窗口大小的1/2，重叠率50%）
+    # [R35] 640切片：missing占20%, dirty占47%, dirty最大356<640不被切
+    window_size: int = 640           # 窗口大小（=img_size，无二次缩放）
+    window_stride: int = 320         # 窗口步长（50%重叠，确保缺陷不被切断）
     
     # 智能裁剪参数（训练时使用）
     crop_padding: int = 100          # 裁剪时的padding（确保缺陷完整）
@@ -77,29 +79,28 @@ class Config:
     # 数据集参数
     # ============================================================
     
-    # 数据集路径（GC10DET数据集）
-    data_dir: str = r"d:\deeplearning\learn\项目\公开数据集GC10DET"
+    # [R24] 切换到xinpaide数据集（两类缺陷：dirty, missing）
+    data_dir: str = r"d:\deeplearning\learn\xinpaide"
     
     # 标签格式: "voc" (XML) 或 "yolo" (TXT)
-    label_format: str = "voc"
+    label_format: str = "yolo"
     
-    # 类别名称（GC10DET: 冲孔、水斑、油斑、丝斑、焊缝）
-    class_names: List[str] = field(default_factory=lambda: [
-        'chongkong', 'shuiban', 'youban', 'siban', 'hanfeng'
-    ])
+    # xinpaide实际只用2类：missing和dirty
+    # YOLO原始ID: missing=3, dirty=4
+    # 重新映射为: missing=0, dirty=1
+    class_names: List[str] = field(default_factory=lambda: ['missing', 'dirty'])
     
-    # 类别映射（XML标签名称 -> 类别ID）
-    # 例如: "1_chongkong" -> 0, "4_shuiban" -> 1, "2_hanfeng" -> 4
+    # YOLO原始class_id → 模型class_id
+    # 只映射实际使用的两类
     class_name_map: Dict = field(default_factory=lambda: {
-        '1_chongkong': 0, 'chongkong': 0,
-        '4_shuiban': 1, 'shuiban': 1,
-        '5_youban': 2, 'youban': 2,
-        '6_siban': 3, 'siban': 3,
-        '2_hanfeng': 4, 'hanfeng': 4,
+        # YOLO class_id 3 (missing) → 模型class_id 0
+        'missing': 0,
+        # YOLO class_id 4 (dirty) → 模型class_id 1
+        'dirty': 1,
     })
     
-    # 最大目标数量（用于padding）
-    max_objects: int = 20  # 从10提升到20（覆盖youban类单张图13个目标的情况）
+    # 最大目标数量
+    max_objects: int = 10  # xinpaide每张图只有1个缺陷，10足够
     
     # ============================================================
     # 训练参数
@@ -152,10 +153,9 @@ class Config:
     # ============================================================
     
     # 预处理方法: "smart_crop" / "sliding_window" / "resize"
-    # - smart_crop: 智能裁剪（训练推荐，利用标签信息）
-    # - sliding_window: 滑动窗口（推理推荐）
-    # - resize: 直接缩放（推荐，简单可靠）
-    preprocess_method: str = "resize"
+    # [R35] 启用滑动窗口：原图4096×2736，缺陷中位209px
+    # 1024切片让缺陷占比12-27%，P2特征图上32px清晰可学
+    preprocess_method: str = "sliding_window"
     
     def __post_init__(self):
         """初始化后处理。"""
@@ -175,19 +175,40 @@ class Config:
         if not self.log_dir:
             self.log_dir = str(base_dir / "logs")
         
-        # 设置数据集子目录
-        self.train_img_dir = str(Path(self.data_dir) / "train" / "images")
-        # 根据标签格式选择目录名
-        label_dir_name = "annotations" if self.label_format == "voc" else "labels"
-        self.train_label_dir = str(Path(self.data_dir) / "train" / label_dir_name)
-        
-        # 验证集：使用test集（GC10DET没有单独的val集）
-        self.val_img_dir = str(Path(self.data_dir) / "test" / "images")
-        self.val_label_dir = str(Path(self.data_dir) / "test" / label_dir_name)
-        
-        # 测试集
-        self.test_img_dir = str(Path(self.data_dir) / "test" / "images")
-        self.test_label_dir = str(Path(self.data_dir) / "test" / label_dir_name)
+        # 设置数据集子目录（xinpaide结构）
+        if self.label_format == "yolo":
+            # [R24] 合并dirty和missing两个子集，按8:2划分训练/验证
+            # 训练集：dirty前80张 + missing前80张 = 160张
+            # 验证集：dirty后20张 + missing后20张 = 40张
+            self.train_img_dirs = [
+                str(Path(self.data_dir) / "dirty" / "images"),
+                str(Path(self.data_dir) / "missing" / "images"),
+            ]
+            self.train_label_dirs = [
+                str(Path(self.data_dir) / "dirty" / "labels"),
+                str(Path(self.data_dir) / "missing" / "labels"),
+            ]
+            self.val_img_dirs = [
+                str(Path(self.data_dir) / "dirty" / "images"),
+                str(Path(self.data_dir) / "missing" / "images"),
+            ]
+            self.val_label_dirs = [
+                str(Path(self.data_dir) / "dirty" / "labels"),
+                str(Path(self.data_dir) / "missing" / "labels"),
+            ]
+            self.test_img_dirs = self.val_img_dirs
+            self.test_label_dirs = self.val_label_dirs
+            # 每个子集取前N张作为训练，剩余作为验证
+            self.train_samples_per_subset = 80
+            self.val_samples_per_subset = 20
+        else:
+            # GC10DET VOC格式
+            self.train_img_dir = str(Path(self.data_dir) / "train" / "images")
+            self.train_label_dir = str(Path(self.data_dir) / "train" / "annotations")
+            self.val_img_dir = str(Path(self.data_dir) / "test" / "images")
+            self.val_label_dir = str(Path(self.data_dir) / "test" / "annotations")
+            self.test_img_dir = str(Path(self.data_dir) / "test" / "images")
+            self.test_label_dir = str(Path(self.data_dir) / "test" / "annotations")
     
     def set_seed(self) -> None:
         """设置随机种子，确保结果可复现。
