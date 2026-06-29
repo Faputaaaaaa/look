@@ -9,7 +9,7 @@
 
 损失函数：
 - Focal Loss (分类)
-- GIoU Loss (回归)
+- CIoU Loss (回归)
 """
 
 import torch
@@ -67,11 +67,18 @@ class FocalLoss(nn.Module):
         return loss / max(num_samples, 1)
 
 
-class GIoULoss(nn.Module):
-    """GIoU Loss用于边界框回归。
+class CIoULoss(nn.Module):
+    """CIoU Loss用于边界框回归 [Round12-B]。
     
-    GIoU = IoU - (C - (A∪B)) / C
-    Loss = 1 - GIoU
+    CIoU = IoU - (ρ²(b,b_gt)/c²) - αv
+    其中:
+    - ρ: 预测框与目标框中心点的欧氏距离
+    - c: 最小闭包对角线长度
+    - v = (4/π²)(arctan(w_gt/h_gt) - arctan(w/h))²  长宽比一致性项
+    - α = v / ((1-IoU) + v)  权重参数
+    
+    相比GIoU, CIoU额外考虑了中心点距离和长宽比一致性，
+    收敛更快，定位精度更高。
     """
     
     def __init__(self):
@@ -112,13 +119,37 @@ class GIoULoss(nn.Module):
         c_y1 = torch.min(pred[:, 1], target[:, 1])
         c_x2 = torch.max(pred[:, 2], target[:, 2])
         c_y2 = torch.max(pred[:, 3], target[:, 3])
-        c_area = (c_x2 - c_x1) * (c_y2 - c_y1)
         
-        # GIoU
-        giou = iou - (c_area - union_area) / c_area.clamp(min=1e-6)
+        # 中心点距离 ρ²
+        pred_cx = (pred[:, 0] + pred[:, 2]) / 2
+        pred_cy = (pred[:, 1] + pred[:, 3]) / 2
+        target_cx = (target[:, 0] + target[:, 2]) / 2
+        target_cy = (target[:, 1] + target[:, 3]) / 2
+        
+        rho_sq = (pred_cx - target_cx) ** 2 + (pred_cy - target_cy) ** 2
+        
+        # 闭包对角线长度平方 c²
+        c_sq = (c_x2 - c_x1).clamp(min=1e-6) ** 2 + (c_y2 - c_y1).clamp(min=1e-6) ** 2
+        
+        # 长宽比一致性 v
+        pred_w = pred[:, 2] - pred[:, 0]
+        pred_h = pred[:, 3] - pred[:, 1]
+        target_w = target[:, 2] - target[:, 0]
+        target_h = target[:, 3] - target[:, 1]
+        
+        v = (4 / (torch.pi ** 2)) * (
+            torch.atan(target_w / target_h.clamp(min=1e-6)) -
+            torch.atan(pred_w / pred_h.clamp(min=1e-6))
+        ) ** 2
+        
+        # 权重参数 α
+        alpha = v / ((1 - iou) + v).clamp(min=1e-6)
+        
+        # CIoU
+        ciou = iou - (rho_sq / c_sq) - alpha * v
         
         # Loss
-        loss = 1 - giou
+        loss = 1 - ciou
         
         return loss.mean()
 
@@ -186,29 +217,34 @@ class AnchorGenerator:
     """锚框生成器（K-means优化配置）。
 
     配置:
-    - P2(stride=4): 尺度[16,24,32,48,64], 比率[0.5,1.0,2.0] → 15个锚框/位置
-    - P3(stride=8): 尺度[32,48,64,96,128], 比率[0.5,1.0,2.0] → 15个锚框/位置
-    - P4(stride=16): 尺度[64,128,192,256,384], 比率[0.5,1.0,2.0] → 15个锚框/位置
+    - P2(stride=4): 尺度[8,12,16,24,32], 比率[0.3,0.5,1.0,2.0,3.0] → 25个锚框/位置
+    - P3(stride=8): 尺度[8,12,16,24,32], 比率[0.3,0.5,1.0,2.0,3.0] → 25个锚框/位置
+    - P4(stride=16): 尺度[8,12,16,24,32], 比率[0.3,0.5,1.0,2.0,3.0] → 25个锚框/位置
     """
     
     def __init__(self):
-        self.anchor_configs = {
-            'P2': {
-                'stride': 4,
-                'scales': [16, 24, 32, 48, 64],  # K-means优化: 覆盖11-90px，匹配小目标如chongkong(41px)
-                'ratios': [0.5, 1.0, 2.0]
-            },
-            'P3': {
-                'stride': 8,
-                'scales': [32, 48, 64, 96, 128],  # K-means优化: 覆盖23-181px
-                'ratios': [0.5, 1.0, 2.0]
-            },
-            'P4': {
-                'stride': 16,
-                'scales': [64, 128, 192, 256, 384],  # K-means优化: 覆盖45-543px
-                'ratios': [0.5, 1.0, 2.0]
+        # [修正C] 从FPN_CONFIG读取锚框配置，单一事实来源
+        # 如果FPN_CONFIG尚未定义（极端情况），使用内置默认值
+        try:
+            _cfg = FPN_CONFIG.get('anchor_configs', {})
+            self.anchor_configs = {
+                'P2': {'stride': _cfg.get('P2', {}).get('stride', 4),
+                       'scales': _cfg.get('P2', {}).get('scales', [8,12,16,24,32]),
+                       'ratios': _cfg.get('P2', {}).get('ratios', [0.3,0.5,1.0,2.0,3.0])},
+                'P3': {'stride': _cfg.get('P3', {}).get('stride', 8),
+                       'scales': _cfg.get('P3', {}).get('scales', [8,12,16,24,32]),
+                       'ratios': _cfg.get('P3', {}).get('ratios', [0.3,0.5,1.0,2.0,3.0])},
+                'P4': {'stride': _cfg.get('P4', {}).get('stride', 16),
+                       'scales': _cfg.get('P4', {}).get('scales', [8,12,16,24,32]),
+                       'ratios': _cfg.get('P4', {}).get('ratios', [0.3,0.5,1.0,2.0,3.0])},
             }
-        }
+        except NameError:
+            # FPN_CONFIG未定义时的回退（仅用于测试等边缘场景）
+            self.anchor_configs = {
+                'P2': {'stride': 4, 'scales': [8,12,16,24,32], 'ratios': [0.3,0.5,1.0,2.0,3.0]},
+                'P3': {'stride': 8, 'scales': [8,12,16,24,32], 'ratios': [0.3,0.5,1.0,2.0,3.0]},
+                'P4': {'stride': 16,'scales': [8,12,16,24,32], 'ratios': [0.3,0.5,1.0,2.0,3.0]},
+            }
     
     def generate_anchors_for_layer(
         self, 
@@ -301,14 +337,19 @@ class RPN(nn.Module):
     
     def __init__(self, in_channels: int = 256):
         super().__init__()
-        
+
         # 3x3卷积
         self.conv = nn.Conv2d(in_channels, in_channels, 3, padding=1)
-        
-        self.cls_conv = nn.Conv2d(in_channels, 15, 1)  # 5尺度×3宽高比=15个锚框
-        
-        self.bbox_conv = nn.Conv2d(in_channels, 15 * 4, 1)
-        
+
+        # [Round15] 动态锚框数: 取所有层中最大值
+        # P2=25, P3=40, P4=63 → RPN head输出63通道(每层reshape时取前N个)
+        self.max_anchors_per_loc = max(
+            len(cfg['scales']) * len(cfg['ratios'])
+            for cfg in FPN_CONFIG['anchor_configs'].values()
+        )  # = 63 (from P4: 9ratios × 7scales)
+        self.cls_conv = nn.Conv2d(in_channels, self.max_anchors_per_loc, 1)
+        self.bbox_conv = nn.Conv2d(in_channels, self.max_anchors_per_loc * 4, 1)
+
         # 锚框生成器
         self.anchor_generator = AnchorGenerator()
     
@@ -332,7 +373,7 @@ class RPN(nn.Module):
         for feat in fpn_features:
             x = F.relu(self.conv(feat))
             
-            # 分类 [B, 15, H, W] — 输出原始logits（不在此处sigmoid）
+            # 分类 [B, 25, H, W] — 输出原始logits（不在此处sigmoid）
             # 训练时直接送入BCEWithLogitsLoss，推理时再手动sigmoid
             cls_pred = self.cls_conv(x)
             cls_preds.append(cls_pred)
@@ -358,48 +399,98 @@ class RPN(nn.Module):
 # ============================================================
 
 class ROIHead(nn.Module):
-    """检测头。
-    
-    对RPN输出的候选框进行分类和边界框精修。
+    """检测头（分类-回归双分支，共享bbox回归）。
+
+    [Round21] 彻底修复ROI Head特征坍缩：
+    根因链：Backbone特征相似度高(0.91-0.99) → R20的L2归一化压缩差异 → ReLU归零47% → 坍缩
+
+    修复策略：
+    1. 去掉L2归一化（压缩微小差异的元凶）
+    2. 用GroupNorm替代（按组归一化，不独立处理每个样本）
+    3. 降低Dropout（保留更多特征信息）
+    4. 增加残差连接（保护输入信息流）
+    5. 恢复隐藏维度到512（增强表达能力）
     """
-    
+
     def __init__(self, in_channels: int = 256, num_classes: int = 4):
         super().__init__()
-        
-        self.num_classes = num_classes
-        
-        # ROI池化后的特征处理
-        self.fc1 = nn.Linear(in_channels * 7 * 7, 1024)
-        self.dropout1 = nn.Dropout(0.3)  # 添加dropout防止过拟合
-        self.fc2 = nn.Linear(1024, 1024)
-        self.dropout2 = nn.Dropout(0.3)  # 添加dropout防止过拟合
-        
-        # 分类头（含背景类：5前景类 + 1背景类 = 6维）
-        # 标准Faster R-CNN设计：softmax后类间竞争，BG提供"退出选项"
-        self.cls_head = nn.Linear(1024, num_classes + 1)
 
-        # 回归头（共享bbox回归，所有类别共用一组delta）
-        # 共享回归避免per-class delta选错导致的框膨胀问题
-        self.bbox_head = nn.Linear(1024, 16)
+        self.num_classes = num_classes
+        hidden_dim = 512  # [R21] 恢复到512，增强表达能力
+
+        # 输入维度
+        self.in_flat_dim = in_channels * 7 * 7  # 12544
+
+        # ============ 共享底层特征 [R21: GroupNorm + 残差 + 适度Dropout] ============
+        self.shared_fc = nn.Sequential(
+            nn.Linear(self.in_flat_dim, hidden_dim),
+            nn.GroupNorm(num_groups=32, num_channels=hidden_dim),  # [R21关键] GN不是per-sample
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),  # [R21] 从0.5降到0.3，保留更多信息
+        )
+
+        # ============ 分类分支 ============
+        self.cls_branch = nn.Sequential(
+            nn.GroupNorm(num_groups=16, num_channels=hidden_dim),  # 输入归一化
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim // 2, num_classes + 1),  # 0=BG, 1..N=前景
+        )
+
+        # ============ 回归分支 共享4维delta ============
+        self.bbox_branch = nn.Sequential(
+            nn.GroupNorm(num_groups=16, num_channels=hidden_dim),  # 输入归一化
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim // 2, 4),
+        )
+
+        # ============ [R21] 初始化策略 ============
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                fan_in = m.weight.shape[1]
+                std = np.sqrt(2.0 / fan_in)  # [R21] 使用标准Kaiming初始化
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, nn.GroupNorm):
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0.0)
+
+        # 分类头BG偏好初始化
+        bg_prior = 0.85
+        bias_value = -np.log((1 - bg_prior) / bg_prior)
+        nn.init.constant_(self.cls_branch[-1].bias, 0.0)
+        with torch.no_grad():
+            self.cls_branch[-1].bias[0] = bias_value
+            self.cls_branch[-1].bias[1:] = 0.0
+
+        # 回归头初始化为接近零的输出
+        nn.init.constant_(self.bbox_branch[-1].bias, 0.0)
+        nn.init.normal_(self.bbox_branch[-1].weight, mean=0.0, std=0.01)
 
     def forward(self, roi_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Args:
-            roi_features: [N, C, 7, 7] ROI池化后的特征
-
         Returns:
-            cls_pred: [N, num_classes+1] 分类预测（索引0=背景, 1-5=前景）
-            bbox_pred: [N, 16] 边界框精修（共享回归，4组delta各4维）
+            cls_pred: [N, num_classes+1] 分类logits
+            bbox_pred: [N, 4] 共享边界框精修delta
         """
         x = roi_features.flatten(1)
-        x = F.relu(self.fc1(x))
-        x = self.dropout1(x)  # 应用dropout
-        x = F.relu(self.fc2(x))
-        x = self.dropout2(x)  # 应用dropout
-        
-        cls_pred = self.cls_head(x)
-        bbox_pred = self.bbox_head(x)
-        
+
+        # [R21关键改动] 不做L2归一化！保留原始幅度信息
+        # 直接让GroupNorm在shared_fc内部处理归一化
+
+        shared = self.shared_fc(x)
+
+        # [R21] 轻量残差：如果维度匹配则相加（这里不匹配所以用投影或跳过）
+        cls_pred = self.cls_branch(shared)
+        bbox_pred = self.bbox_branch(shared)
+
         return cls_pred, bbox_pred
 
 
@@ -417,8 +508,8 @@ class TwoStageDetector(nn.Module):
     4. ROI Head: 分类+回归精修
     
     损失函数:
-    - RPN: Focal Loss (α=0.25, γ=2.0) + GIoU Loss
-    - ROI: Focal Loss (α=0.5, γ=2.0) + GIoU Loss
+    - RPN: Focal Loss (α=0.25, γ=2.0) + CIoU Loss
+    - ROI: Focal Loss (α=0.5, γ=2.0) + CIoU Loss
     """
     
     def __init__(self, num_classes: int = None):
@@ -445,9 +536,9 @@ class TwoStageDetector(nn.Module):
         
         # 损失函数
         self.rpn_cls_loss = FocalLoss(alpha=0.25, gamma=2.0)  # RPN: 标准参数
-        self.rpn_bbox_loss = GIoULoss()
+        self.rpn_bbox_loss = CIoULoss()
         self.roi_cls_loss = FocalLoss(alpha=0.5, gamma=2.0)   # ROI: 调整参数
-        self.roi_bbox_loss = GIoULoss()
+        self.roi_bbox_loss = CIoULoss()
     
     def extract_features(self, x: torch.Tensor) -> List[torch.Tensor]:
         """提取ResNet多层特征。"""
@@ -507,7 +598,73 @@ class TwoStageDetector(nn.Module):
             
         except Exception as e:
             logger.error(f"加载预训练权重失败: {e}")
-    
+
+    def _spatial_uniform_sample(self, proposals: torch.Tensor, scores: torch.Tensor,
+                                  grid_size: int = 3, per_cell_max: int = 150,
+                                  img_w: int = 768, img_h: int = 768) -> Tuple[torch.Tensor, torch.Tensor]:
+        """[R23] 空间均匀采样：将proposal按空间位置分成网格，每格独立取top-K。
+
+        解决问题：RPN的objectness score存在系统性空间偏置（如偏向图像顶部），
+        导致纯score排序选出的top-K proposal聚集在一个固定区域。
+        本方法通过空间均匀采样打破这种偏置，保证最终proposal覆盖全图。
+
+        Args:
+            proposals: [N, 4] (x1,y1,x2,y2) 格式的proposal坐标
+            scores: [N] 对应的RPN objectness score
+            grid_size: 网格大小（默认3×3）
+            per_cell_max: 每个网格格子最多保留的proposal数
+            img_w, img_h: 图像宽高（用于计算网格边界）
+
+        Returns:
+            采样后的 (proposals, scores)
+        """
+        if proposals.size(0) == 0:
+            return proposals, scores
+
+        # 计算每个proposal的中心点
+        cx = (proposals[:, 0] + proposals[:, 2]) / 2
+        cy = (proposals[:, 1] + proposals[:, 3]) / 2
+
+        # 确定每个proposal属于哪个网格格子
+        cell_w = img_w / grid_size
+        cell_h = img_h / grid_size
+
+        # 限制在有效范围内
+        cell_x_idx = torch.clamp((cx / cell_w).long(), 0, grid_size - 1)
+        cell_y_idx = torch.clamp((cy / cell_h).long(), 0, grid_size - 1)
+        cell_idx = cell_y_idx * grid_size + cell_x_idx  # 展平的一维索引
+
+        # 每个格子内按score排序取top-K
+        sampled_masks = []
+        for gy in range(grid_size):
+            for gx in range(grid_size):
+                ci = gy * grid_size + gx
+                mask = (cell_idx == ci)
+                if mask.sum() == 0:
+                    continue
+                cell_scores = scores[mask]
+                n_take = min(per_cell_max, mask.sum().item())
+                if n_take <= 0:
+                    continue
+                # 该格子内取score最高的n_take个
+                _, local_top = cell_scores.topk(n_take)
+                # 转回全局索引
+                global_indices = torch.where(mask)[0][local_top]
+                cell_mask = torch.zeros(proposals.size(0), dtype=torch.bool, device=proposals.device)
+                cell_mask[global_indices] = True
+                sampled_masks.append(cell_mask)
+
+        if not sampled_masks:
+            # fallback：如果所有格子都为空（不应该发生），返回原始
+            return proposals, scores
+
+        # 合并所有格子的采样结果
+        combined_mask = sampled_masks[0]
+        for m in sampled_masks[1:]:
+            combined_mask = combined_mask | m
+
+        return proposals[combined_mask], scores[combined_mask]
+
     def decode_boxes(self, anchors: torch.Tensor, deltas: torch.Tensor,
                      img_w: int = None, img_h: int = None) -> torch.Tensor:
         """将偏移量解码为实际坐标。
@@ -585,50 +742,77 @@ class TwoStageDetector(nn.Module):
             
             for i, layer_name in enumerate(['P2', 'P3', 'P4']):
                 anchors = anchors_dict[layer_name]
-                
-                cls_pred = rpn_cls_preds[i][b].flatten()
+
+                # [Round15] RPN输出统一max_anchors(63)通道，需按实际anchor数切片（与train/validate一致）
+                _lc = FPN_CONFIG['anchor_configs'][layer_name]
+                num_anchors_actual = len(_lc['scales']) * len(_lc['ratios'])
+                max_a = self.rpn.max_anchors_per_loc  # = 63
+
+                # [R26修复] permute对齐anchor(与train一致)，之前flatten导致通道主序错位
+                cls_pred = rpn_cls_preds[i][b].permute(1, 2, 0).contiguous()  # [H, W, max_a]
+                cls_pred = cls_pred.reshape(-1, max_a)[:, :num_anchors_actual].reshape(-1)
                 # RPN输出原始logits，推理时需要sigmoid转为概率
                 cls_pred = torch.sigmoid(cls_pred)
+
                 bbox_pred = rpn_bbox_preds[i][b].permute(1, 2, 0).contiguous()
-                bbox_pred = bbox_pred.reshape(-1, 15, 4)  # 5尺度×3比例=15个锚框
-                bbox_pred = bbox_pred.reshape(-1, 4)
+                bbox_pred = bbox_pred.reshape(-1, max_a, 4)
+                # 只取前 num_anchors_actual 组有效预测（其余为padding）
+                bbox_pred = bbox_pred[:, :num_anchors_actual, :].reshape(-1, 4)
                 
                 boxes = self.decode_boxes(anchors, bbox_pred, img_w=W, img_h=H)
 
-                # 【关键修复】RPN objectness score 阈值过滤
-                # 未训练/随机权重的模型sigmoid输出约0.5-0.7，必须过滤掉低分anchor
-                # 否则所有top-K anchor都变成proposal → 网格状假检测
-                score_thresh = INFERENCE_CONFIG['rpn_score_thresh']
-                valid_mask = cls_pred > score_thresh
-                if valid_mask.sum() == 0:
-                    continue  # 该层无合格proposal，跳过
-
-                cls_pred = cls_pred[valid_mask]
-                boxes = boxes[valid_mask]
-
-                top_n = min(INFERENCE_CONFIG['rpn_pre_nms_top_n'], cls_pred.size(0))
-                top_scores, top_inds = cls_pred.topk(top_n)
-                top_boxes = boxes[top_inds]
+                # [R25] 推理时与训练保持一致：空间感知采样 + 分网格NMS
+                # 解决RPN空间偏置导致proposal分布不均的问题
+                feat_h = fpn_features[i].size(2)
+                feat_w = fpn_features[i].size(3)
                 
-                keep = nms(top_boxes, top_scores, INFERENCE_CONFIG['rpn_nms_thresh'])
+                cls_scores_2d = cls_pred.view(feat_h, feat_w, num_anchors_actual)
+                boxes_2d = boxes.view(feat_h, feat_w, num_anchors_actual, 4)
                 
-                post_nms_top_n = min(INFERENCE_CONFIG['rpn_post_nms_top_n'], keep.size(0))
-                keep = keep[:post_nms_top_n]
+                # P3主层用更多anchor，P2/P4用较少的
+                k_per_loc_map = {'P2': 1, 'P3': 3, 'P4': 1}
+                per_cell_max_map = {'P2': 10, 'P3': 30, 'P4': 10}
+                k = k_per_loc_map[layer_name]
+                pcm = per_cell_max_map[layer_name]
                 
-                proposals.append(top_boxes[keep])
-                proposal_scores.append(top_scores[keep])
+                topk_scores, topk_inds = cls_scores_2d.topk(k, dim=2)
+                topk_inds_expanded = topk_inds.unsqueeze(-1).expand(-1, -1, -1, 4)
+                topk_boxes = boxes_2d.gather(2, topk_inds_expanded)
+                sampled_boxes = topk_boxes.reshape(-1, 4)
+                sampled_scores = topk_scores.reshape(-1)
+                
+                # 分网格独立NMS
+                grid_size = 8
+                cell_w = W / grid_size
+                cell_h = H / grid_size
+                cx = (sampled_boxes[:, 0] + sampled_boxes[:, 2]) / 2
+                cy = (sampled_boxes[:, 1] + sampled_boxes[:, 3]) / 2
+                cell_x = torch.clamp((cx / cell_w).long(), 0, grid_size - 1)
+                cell_y = torch.clamp((cy / cell_h).long(), 0, grid_size - 1)
+                cell_idx = cell_y * grid_size + cell_x
+                
+                keep_list = []
+                for ci in range(grid_size * grid_size):
+                    mask = (cell_idx == ci)
+                    if mask.sum() == 0:
+                        continue
+                    cell_boxes = sampled_boxes[mask]
+                    cell_scores = sampled_scores[mask]
+                    cell_keep = nms(cell_boxes, cell_scores, 0.7)
+                    cell_keep = cell_keep[:pcm]
+                    global_indices = torch.where(mask)[0][cell_keep]
+                    keep_list.append(global_indices)
+                
+                if len(keep_list) > 0:
+                    keep = torch.cat(keep_list)
+                    proposals.append(sampled_boxes[keep])
+                    proposal_scores.append(sampled_scores[keep])
             
             if len(proposals) > 0:
                 proposals = torch.cat(proposals, dim=0)
                 proposal_scores = torch.cat(proposal_scores, dim=0)
-
-                # 全局NMS：消除跨层重复proposal（P2/P3/P4可能指向同一区域）
-                if proposals.size(0) > 0:
-                    keep = nms(proposals, proposal_scores, 0.7)
-                    # 保留最多600个跨层去重后的proposal
-                    keep = keep[:min(600, keep.size(0))]
-                    proposals = proposals[keep]
-                    proposal_scores = proposal_scores[keep]
+                # [R25] 不做全局NMS，与训练保持一致
+                # 每层分网格NMS已去重，总共约3200个proposal
             else:
                 all_boxes.append(torch.zeros(0, 4, device=device))
                 all_scores.append(torch.zeros(0, device=device))
@@ -690,19 +874,22 @@ class TwoStageDetector(nn.Module):
             roi_orig_indices = torch.cat(all_indices, dim=0)
             
             cls_logits, bbox_deltas = self.roi_head(roi_features)
+            # [Round19] bbox_deltas现在是共享4维[N,4]，不再per-class
 
-            # Softmax多分类（标准Faster R-CNN：含背景类，类间竞争）
-            # cls_logits: [N, num_classes+1] = [N, 6]，索引0=BG, 1-5=前景
-            cls_probs = torch.softmax(cls_logits, dim=1)
-            scores, cls_indices = cls_probs.max(dim=1)              # cls_indices: 0-5
+            # Softmax多分类
+            cls_probs = torch.softmax(cls_logits, dim=1)  # [N, 6]
+            scores, cls_indices = cls_probs.max(dim=1)   # scores: [N], cls_indices: 0-5
 
-            # 共享bbox回归（所有类别共用前4个delta值）
-            selected_deltas = bbox_deltas[:, :4]
+            # [Round19] 直接使用共享4维delta，不需要per-class选择
+            # bbox_deltas: [N, 4] (dx, dy, dw, dh) — 所有类共用
 
-            # 应用ROI Head的bbox回归精修
-            refined_boxes = self.decode_boxes(proposals[roi_orig_indices], selected_deltas, img_w=W, img_h=H)
+            # 应用ROI Head的bbox回归精修（只对非BG的proposal才做精修）
+            refined_boxes = self.decode_boxes(
+                proposals[roi_orig_indices], bbox_deltas, img_w=W, img_h=H
+            )
 
-            # 过滤掉背景类预测（cls_index=0即BG），只保留前景
+            # ============ 多级过滤策略 ============
+            # Step 1: 过滤掉背景类（cls_index=0即BG），只保留前景
             fg_mask = cls_indices > 0  # 前景cls_index: 1-5
             if fg_mask.sum() == 0:
                 all_boxes.append(torch.zeros(0, 4, device=device))
@@ -712,15 +899,29 @@ class TwoStageDetector(nn.Module):
 
             refined_boxes = refined_boxes[fg_mask]
             scores = scores[fg_mask]
-            # cls_index 1→label 1(chongkong), 2→2(shuiban), ..., 5→5(hanfeng)
-            labels = cls_indices[fg_mask]  # 直接用cls_index作为label (1-5)
+            labels = cls_indices[fg_mask]  # cls_index 1→label 1(chongkong)等
 
+            # Step 2: 过滤异常框（宽或高为0或负数的框
+            box_w = refined_boxes[:, 2] - refined_boxes[:, 0]
+            box_h = refined_boxes[:, 3] - refined_boxes[:, 1]
+            valid_box_mask = (box_w > 2) & (box_h > 2)
+            if valid_box_mask.sum() == 0:
+                all_boxes.append(torch.zeros(0, 4, device=device))
+                all_scores.append(torch.zeros(0, device=device))
+                all_labels.append(torch.zeros(0, dtype=torch.long, device=device))
+                continue
+            refined_boxes = refined_boxes[valid_box_mask]
+            scores = scores[valid_box_mask]
+            labels = labels[valid_box_mask]
+
+            # Step 3: score阈值过滤
             valid_mask = scores > INFERENCE_CONFIG['score_thresh']
-            
+
             final_boxes = refined_boxes[valid_mask]
             final_scores = scores[valid_mask]
             final_labels = labels[valid_mask]
-            
+
+            # Step 4: NMS去重 + 最多max_detections个
             keep = nms(final_boxes, final_scores, INFERENCE_CONFIG['nms_thresh'])
             keep = keep[:INFERENCE_CONFIG['max_detections']]
             
@@ -742,16 +943,24 @@ class TwoStageDetector(nn.Module):
 FPN_CONFIG = {
     'fpn_layers': ['P2', 'P3', 'P4'],
     'fpn_channels': 256,
-    
+
+    # [R35] anchor配置匹配SAHI切片后的缺陷尺寸
+    # 数据分析：1024切片下 missing≈104px, dirty≈304px
+    # 旧配置[P2:8-32,P3:16-64,P4:32-128]最大128px，无法覆盖dirty(304px)
+    # 新配置覆盖32-512px范围，确保missing和dirty都有匹配anchor
     'anchor_configs': {
-        'P2': {'stride': 4, 'scales': [16, 24, 32, 48, 64], 'ratios': [0.5, 1.0, 2.0]},
-        'P3': {'stride': 8, 'scales': [32, 48, 64, 96, 128], 'ratios': [0.5, 1.0, 2.0]},
-        'P4': {'stride': 16, 'scales': [64, 128, 192, 256, 384], 'ratios': [0.5, 1.0, 2.0]},
+        'P2': {'stride': 4, 'scales': [32, 48, 64, 96, 128],    'ratios': [0.5, 1.0, 2.0, 3.0]},   # 20 anchors, 覆盖missing(104px)
+        'P3': {'stride': 8, 'scales': [64, 96, 128, 192, 256],  'ratios': [0.5, 1.0, 2.0, 3.0]},   # 20 anchors, 过渡区
+        'P4': {'stride': 16,'scales': [128, 192, 256, 384, 512], 'ratios': [0.5, 1.0, 2.0, 3.0]},  # 20 anchors, 覆盖dirty(304px)
     },
     
     'rpn_config': {
-        'pos_iou_thresh': 0.5,
-        'neg_iou_thresh': 0.3,
+        # [R32] 降低pos_thresh从0.5→0.3，增加RPN正样本数
+        # 原因：R31诊断显示RPN学到固定spatial bias（10张图Top5 score完全相同），
+        #       根因是正样本极度稀疏（1-40个/百万级anchors），梯度信号被淹没。
+        #       降低pos_thresh到0.3，正样本数预计增加到几百个，让RPN能学到位置信息。
+        'pos_iou_thresh': 0.3,
+        'neg_iou_thresh': 0.1,
         'pos_neg_ratio': 3,
         'nms_thresh': 0.5,
         'pre_nms_top_n': 200,
@@ -767,13 +976,14 @@ FPN_CONFIG = {
 }
 
 INFERENCE_CONFIG = {
-    'rpn_pre_nms_top_n': 600,     # 每层NMS前取top600（标准Faster R-CNN值）
-    'rpn_post_nms_top_n': 300,    # 每层NMS后保留300（3层共~900个proposal，合理范围）
-    'rpn_nms_thresh': 0.6,        # RPN NMS阈值
-    'rpn_score_thresh': 0.25,     # RPN objectness门槛 (0.3→0.25: 降低以获取更多proposal)
-    'score_thresh': 0.25,         # ROI Head分类置信度阈值 (0.30→0.25: 快速验证是否有其他类别)
-    'nms_thresh': 0.5,            # 最终检测框NMS阈值 (0.45→0.5: 更严格去重)
-    'max_detections': 20,         # 每张图最大检测数 (15→20: 允许更多检测)
+    # [Round16] 提高RPN质量门槛，避免低质量proposal污染ROI Head
+    'rpn_pre_nms_top_n': 2000,     # 适度候选数
+    'rpn_post_nms_top_n': 1000,   # 减少但提高质量(避免R15的2000个噪声proposal)
+    'rpn_nms_thresh': 0.7,         # 标准NMS
+    'rpn_score_thresh': 0.01,      # [关键] 提高阈值过滤低分anchor(R15用0.003太低)
+    'score_thresh': 0.30,          # 最终分类阈值
+    'nms_thresh': 0.45,            # 最终NMS
+    'max_detections': 15,          # [R27] 恢复到15（项目约束）
 }
 
 

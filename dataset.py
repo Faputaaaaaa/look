@@ -46,25 +46,34 @@ class DefectDataset(Dataset):
     
     def __init__(
         self,
-        img_dir: str,
-        label_dir: str,
+        img_dir,
+        label_dir,
         mode: str = 'train',
         transform: Optional[transforms.Compose] = None,
         preprocess_method: str = None,
-        label_format: str = None
+        label_format: str = None,
+        max_samples_per_dir: int = None,
+        from_end: bool = False,
     ) -> None:
         """初始化数据集。
         
         Args:
-            img_dir: 图像目录
-            label_dir: 标签目录
+            img_dir: 图像目录（str或list[str]，支持多目录合并）
+            label_dir: 标签目录（str或list[str]，与img_dir对应）
             mode: 模式
             transform: 图像变换
             preprocess_method: 预处理方法
             label_format: 标签格式
+            max_samples_per_dir: 每个目录最多加载的样本数（None表示全部）
+            from_end: 是否从末尾开始取样本（用于验证集，避免与训练集重叠）
         """
-        self.img_dir = Path(img_dir)
-        self.label_dir = Path(label_dir)
+        # 支持单目录或多目录
+        if isinstance(img_dir, (list, tuple)):
+            self.img_dirs = [Path(d) for d in img_dir]
+            self.label_dirs = [Path(d) for d in label_dir]
+        else:
+            self.img_dirs = [Path(img_dir)]
+            self.label_dirs = [Path(label_dir)]
         self.mode = mode
         self.transform = transform  # 保持兼容性
         # 新增：分离颜色增强和归一化
@@ -72,6 +81,8 @@ class DefectDataset(Dataset):
         self.normalize_transform = getattr(transform, 'normalize_transform', None) if transform else None
         self.preprocess_method = preprocess_method or config.preprocess_method
         self.label_format = label_format or config.label_format
+        self.max_samples_per_dir = max_samples_per_dir
+        self.from_end = from_end
         
         # 从config获取参数
         self.img_size = config.img_size
@@ -95,63 +106,87 @@ class DefectDataset(Dataset):
         """
         samples = []
         
-        # 获取所有图片
-        img_files = list(self.img_dir.glob("*.jpg")) + list(self.img_dir.glob("*.png"))
-        
-        for img_file in img_files:
-            # 查找对应的标签文件
-            if self.label_format == "voc":
-                label_file = self.label_dir / f"{img_file.stem}.xml"
-            else:
-                label_file = self.label_dir / f"{img_file.stem}.txt"
+        for dir_idx, (img_dir, label_dir) in enumerate(zip(self.img_dirs, self.label_dirs)):
+            # 获取所有图片并排序（确保可复现）
+            img_files = sorted(list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png")))
             
-            # 读取标签
-            bboxes = []
-            if label_file.exists():
-                if self.label_format == "voc":
-                    bboxes = self._read_voc_labels(label_file)
+            # 限制每个目录的样本数
+            if self.max_samples_per_dir is not None:
+                if self.from_end:
+                    img_files = img_files[-self.max_samples_per_dir:]
                 else:
-                    bboxes = self._read_yolo_labels(label_file)
+                    img_files = img_files[:self.max_samples_per_dir]
             
-            if self.preprocess_method == "smart_crop":
-                # 智能裁剪：每个缺陷生成一个样本
-                if len(bboxes) > 0:
-                    for i, bbox in enumerate(bboxes):
+            for img_file in img_files:
+                # 查找对应的标签文件
+                if self.label_format == "voc":
+                    label_file = label_dir / f"{img_file.stem}.xml"
+                else:
+                    label_file = label_dir / f"{img_file.stem}.txt"
+                
+                # 读取标签
+                bboxes = []
+                if label_file.exists():
+                    if self.label_format == "voc":
+                        bboxes = self._read_voc_labels(label_file)
+                    else:
+                        bboxes = self._read_yolo_labels(label_file)
+                
+                if self.preprocess_method == "smart_crop":
+                    # 智能裁剪：每个缺陷生成一个样本
+                    if len(bboxes) > 0:
+                        for i, bbox in enumerate(bboxes):
+                            samples.append({
+                                'img_path': str(img_file),
+                                'label_path': str(label_file),
+                                'bbox_idx': i,
+                                'all_bboxes': bboxes,
+                                'target_bbox': bbox
+                            })
+                    else:
+                        # 无缺陷图片，随机裁剪
                         samples.append({
                             'img_path': str(img_file),
                             'label_path': str(label_file),
-                            'bbox_idx': i,
-                            'all_bboxes': bboxes,
-                            'target_bbox': bbox
+                            'bbox_idx': -1,
+                            'all_bboxes': [],
+                            'target_bbox': None
                         })
-                else:
-                    # 无缺陷图片，随机裁剪
+                
+                elif self.preprocess_method == "sliding_window":
+                    # [R35] SAHI滑动窗口：含缺陷窗口全保留 + 背景窗口限量
+                    # 原图4096×2736，1024切片+stride512产生~35窗口/图
+                    # 但每图仅1个缺陷，含缺陷窗口约2-4个，其余为纯背景
+                    # 背景>缺陷会淹没RPN正样本，故每图限量2个背景窗口
+                    windows = self._generate_windows(img_file)
+                    pos_window_samples = []
+                    neg_window_samples = []
+                    for window in windows:
+                        window_bboxes = self._get_bboxes_in_window(bboxes, window)
+                        sample_item = {
+                            'img_path': str(img_file),
+                            'label_path': str(label_file),
+                            'window': window,
+                            'all_bboxes': window_bboxes
+                        }
+                        if len(window_bboxes) > 0:
+                            pos_window_samples.append(sample_item)
+                        else:
+                            neg_window_samples.append(sample_item)
+                    # 含缺陷窗口全保留
+                    samples.extend(pos_window_samples)
+                    # 背景窗口限量：每图最多2个（随机采样）
+                    max_neg_per_img = 2
+                    if len(neg_window_samples) > max_neg_per_img:
+                        neg_window_samples = random.sample(neg_window_samples, max_neg_per_img)
+                    samples.extend(neg_window_samples)
+                
+                else:  # resize
                     samples.append({
                         'img_path': str(img_file),
                         'label_path': str(label_file),
-                        'bbox_idx': -1,
-                        'all_bboxes': [],
-                        'target_bbox': None
+                        'all_bboxes': bboxes
                     })
-            
-            elif self.preprocess_method == "sliding_window":
-                # 滑动窗口：生成所有窗口位置
-                windows = self._generate_windows(img_file)
-                for window in windows:
-                    window_bboxes = self._get_bboxes_in_window(bboxes, window)
-                    samples.append({
-                        'img_path': str(img_file),
-                        'label_path': str(label_file),
-                        'window': window,
-                        'all_bboxes': window_bboxes
-                    })
-            
-            else:  # resize
-                samples.append({
-                    'img_path': str(img_file),
-                    'label_path': str(label_file),
-                    'all_bboxes': bboxes
-                })
         
         return samples
     
@@ -222,14 +257,22 @@ class DefectDataset(Dataset):
     
     def _read_yolo_labels(self, label_path: Path) -> List[Dict]:
         """读取YOLO格式TXT标签。
-        
+
         Args:
             label_path: 标签文件路径
-        
+
         Returns:
             List[Dict]: 标签列表
         """
         bboxes = []
+
+        # [R24] YOLO数字ID → 类名 → 模型class_id 的映射
+        # xinpaide classes.txt: 0=ghosting, 1=faint, 2=fuzziness, 3=missing, 4=dirty, 5=scratch, 6=body_scratch
+        yolo_id_to_name = {
+            0: 'ghosting', 1: 'faint', 2: 'fuzziness',
+            3: 'missing', 4: 'dirty', 5: 'scratch', 6: 'body_scratch'
+        }
+
         try:
             with open(label_path, 'r', encoding='utf-8') as f:
                 for line in f:
@@ -238,12 +281,19 @@ class DefectDataset(Dataset):
                         continue
                     parts = line.split()
                     if len(parts) >= 5:
-                        class_id = int(parts[0])
+                        yolo_class_id = int(parts[0])
                         cx, cy, w, h = map(float, parts[1:5])
-                        
+
                         if w > 0 and h > 0 and 0 <= cx <= 1 and 0 <= cy <= 1:
+                            # 转换为类名，再通过class_name_map转为模型class_id
+                            class_name = yolo_id_to_name.get(yolo_class_id)
+                            if class_name and class_name in self.class_name_map:
+                                model_class_id = self.class_name_map[class_name]
+                            else:
+                                continue  # 跳过不在目标类别中的缺陷
+
                             bboxes.append({
-                                'class_id': class_id,
+                                'class_id': model_class_id,
                                 'cx': cx,
                                 'cy': cy,
                                 'w': w,
@@ -251,7 +301,7 @@ class DefectDataset(Dataset):
                             })
         except Exception as e:
             print(f"[Dataset] 读取YOLO标签失败: {label_path}, 错误: {e}")
-        
+
         return bboxes
     
     def _generate_windows(self, img_path: Path) -> List[Dict]:
@@ -491,7 +541,8 @@ class DefectDataset(Dataset):
         new_img.paste(img_resized, (offset_x, offset_y))
         img_resized = new_img
         
-        # 3. 同步变换bbox坐标（从原图归一化坐标 → letterbox后新归一化坐标）
+        # 3. 同步变换bbox坐标（从原图归一化坐标 → letterbox后像素坐标）
+        # 注意：后续数据增强（翻转、RandomCrop）都使用像素坐标系
         if num_objects > 0:
             for i in range(len(bboxes)):
                 cx, cy, bw, bh, cls_id = bboxes[i]
@@ -505,22 +556,62 @@ class DefectDataset(Dataset):
                 new_cy_px = cy_px * scale + offset_y
                 new_bw_px = bw_px * scale
                 new_bh_px = bh_px * scale
-                # 重新归一化到目标尺寸
                 bboxes[i] = [
-                    new_cx_px / w,
-                    new_cy_px / h,
-                    new_bw_px / w,
-                    new_bh_px / h,
+                    new_cx_px,
+                    new_cy_px,
+                    new_bw_px,
+                    new_bh_px,
                     cls_id
                 ]
         
         # 4. 数据增强（在letterbox后的正方形图上操作）
         if self.mode == 'train' and config.use_augmentation:
+            # 4.0 马赛克增强 [Round14] — 以p=0.5概率将4张图拼接为1张
+            if random.random() < 0.5:
+                img_resized, bboxes = self._mosaic_augment(img, img_w, img_h)
+                num_objects = len(bboxes)
+
+            # 4.0.5 [R22] RandomCrop — 打破空间偏置（特别是Y轴坍缩）
+            # 以p=0.35概率随机裁剪70%-100%区域，再缩放回原尺寸
+            # 这迫使模型学习位置不变的特征，而非记忆固定空间模式
+            if random.random() < 0.35 and len(bboxes) > 0:
+                crop_ratio = random.uniform(0.7, 1.0)
+                crop_w = int(self.img_size * crop_ratio)
+                crop_h = int(self.img_size * crop_ratio)
+                max_left = max(0, self.img_size - crop_w)
+                max_top = max(0, self.img_size - crop_h)
+                left = random.randint(0, max_left) if max_left > 0 else 0
+                top = random.randint(0, max_top) if max_top > 0 else 0
+
+                img_resized = img_resized.crop((left, top, left + crop_w, top + crop_h))
+                img_resized = img_resized.resize((self.img_size, self.img_size), Image.BILINEAR)
+
+                # 同步调整bbox坐标 (cx, cy, w, h → 新坐标系)
+                new_bboxes = []
+                for b in bboxes:
+                    cx, cy, bw, bh, cls_id = b
+                    new_cx = (cx - left) / crop_ratio if crop_ratio > 0 else cx
+                    new_cy = (cy - top) / crop_ratio if crop_ratio > 0 else cy
+                    new_bw = bw / crop_ratio if crop_ratio > 0 else bw
+                    new_bh = bh / crop_ratio if crop_ratio > 0 else bh
+                    # 只保留中心仍在图像内的框（允许部分越界）
+                    if 0 < new_cx < self.img_size and 0 < new_cy < self.img_size:
+                        new_bboxes.append([new_cx, new_cy, new_bw, new_bh, cls_id])
+                # 如果所有框都被裁掉了，保留原始空列表（后面会处理）
+                if new_bboxes:
+                    bboxes = new_bboxes
+                    num_objects = len(bboxes)
+
             # 4.1 水平翻转
             if random.random() < 0.5:
                 img_resized = img_resized.transpose(Image.FLIP_LEFT_RIGHT)
-                bboxes = [[1.0 - b[0], b[1], b[2], b[3], b[4]] for b in bboxes]
-            
+                bboxes = [[self.img_size - b[0], b[1], b[2], b[3], b[4]] for b in bboxes]
+
+            # 4.1.5 [R22] 垂直翻转（打破Y轴对称性偏置）
+            if random.random() < 0.3:
+                img_resized = img_resized.transpose(Image.FLIP_TOP_BOTTOM)
+                bboxes = [[b[0], self.img_size - b[1], b[2], b[3], b[4]] for b in bboxes]
+
             # 4.2 颜色增强
             if self.color_transform:
                 img_resized = self.color_transform(img_resized)
@@ -530,6 +621,18 @@ class DefectDataset(Dataset):
             img_tensor = self.normalize_transform(img_resized)
         else:
             img_tensor = transforms.ToTensor()(img_resized)
+        
+        # 5.5 bbox从像素坐标归一化到0-1范围（模型训练使用归一化坐标）
+        if num_objects > 0:
+            for i in range(len(bboxes)):
+                cx, cy, bw, bh, cls_id = bboxes[i]
+                bboxes[i] = [
+                    cx / self.img_size,
+                    cy / self.img_size,
+                    bw / self.img_size,
+                    bh / self.img_size,
+                    cls_id
+                ]
         
         # 6. 填充标注框到固定大小
         bboxes_padded = self._pad_bboxes(bboxes)
@@ -543,6 +646,142 @@ class DefectDataset(Dataset):
         
         return img_tensor, torch.tensor(num_objects, dtype=torch.long), bboxes_padded, meta
     
+    def _mosaic_augment(
+        self,
+        img: Image.Image,
+        orig_w: int,
+        orig_h: int
+    ) -> Tuple[Image.Image, List[List]]:
+        """[Round14] 马赛克增强：将4张随机图片拼接为1张img_size×img_size的图。
+
+        拼接布局:
+            ┌───────┬───────┐
+            │ img0  │ img1  │
+            ├───────┼───────┤
+            │ img2  │ img3  │
+            └───────┴───────┘
+
+        Returns:
+            Tuple[Image.Image, List[List]]: (拼接后的图像, 归一化bbox列表[cx,cy,w,h,cls_id])
+        """
+        target_size = self.img_size
+        half = target_size // 2
+
+        # 随机选3个其他样本索引（加上当前共4张）
+        indices = [idx for idx in range(len(self.samples)) if self.samples[idx].get('all_bboxes')]
+        if len(indices) < 4:
+            # 样本不足4张时，回退到原图letterbox处理
+            return self._letterbox_single(img, orig_w, orig_h)
+
+        chosen = random.sample(indices, min(4, len(indices)))
+        # 确保当前图片在候选中（如果当前图有标注框）
+        mosaic_images = []
+        mosaic_bboxes = []
+
+        for i, sample_idx in enumerate(chosen):
+            sample = self.samples[sample_idx]
+            try:
+                src_img = Image.open(sample['img_path']).convert('RGB')
+                sw, sh = src_img.size
+            except Exception:
+                continue
+
+            bboxes_raw = sample.get('all_bboxes', [])
+
+            # 计算裁剪区域（基于中心偏移，增加多样性）
+            cx_offset = random.uniform(-0.125, 0.125)  # ±12.5%中心偏移
+            cy_offset = random.uniform(-0.125, 0.125)
+
+            if i == 0:      # 左上
+                crop_x1, crop_y1 = 0, 0
+                crop_x2, crop_y2 = sw // 2 + int(sw * cx_offset), sh // 2 + int(sh * cy_offset)
+                paste_x, paste_y = 0, 0
+            elif i == 1:    # 右上
+                crop_x1 = sw // 2 + int(sw * cx_offset)
+                crop_y1 = 0
+                crop_x2, crop_y2 = sw, sh // 2 + int(sh * cy_offset)
+                paste_x, paste_y = half, 0
+            elif i == 2:    # 左下
+                crop_x1, crop_y1 = 0, sh // 2 + int(sh * cy_offset)
+                crop_x2 = sw // 2 + int(sw * cx_offset)
+                crop_y2 = sh
+                paste_x, paste_y = 0, half
+            else:           # 右下
+                crop_x1 = sw // 2 + int(sw * cx_offset)
+                crop_y1 = sh // 2 + int(sh * cy_offset)
+                crop_x2, crop_y2 = sw, sh
+                paste_x, paste_y = half, half
+
+            # 裁剪并resize到half×half
+            crop_x1 = max(0, min(crop_x1, sw - 1))
+            crop_y1 = max(0, min(crop_y1, sh - 1))
+            crop_x2 = max(crop_x1 + 1, min(crop_x2, sw))
+            crop_y2 = max(crop_y1 + 1, min(crop_y2, sh))
+
+            cropped = src_img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
+            resized = cropped.resize((half, half), Image.BILINEAR)
+
+            # 转换bbox坐标：原图归一化 → 裁剪区域像素 → half尺寸像素 → target_size归一化
+            region_w = crop_x2 - crop_x1
+            region_h = crop_y2 - crop_y1
+            for bbox in bboxes_raw:
+                # 原图归一化 → 原图像素
+                px_cx = bbox['cx'] * sw
+                px_cy = bbox['cy'] * sh
+                px_w = bbox['w'] * sw
+                px_h = bbox['h'] * sh
+
+                # 检查是否在裁剪区域内
+                if (crop_x1 <= px_cx <= crop_x2 and crop_y1 <= px_cy <= crop_y2):
+                    # → 裁剪区域相对坐标
+                    rel_cx = (px_cx - crop_x1) / region_w
+                    rel_cy = (px_cy - crop_y1) / region_h
+                    rel_w = px_w / region_w
+                    rel_h = px_h / region_h
+
+                    # → target_size归一化坐标
+                    new_cx = (paste_x + rel_cx * half) / target_size
+                    new_cy = (paste_y + rel_cy * half) / target_size
+                    new_w = rel_w * half / target_size
+                    new_h = rel_h * half / target_size
+
+                    # 边界裁剪
+                    new_cx = max(0.01, min(new_cx, 0.99))
+                    new_cy = max(0.01, min(new_cy, 0.99))
+
+                    mosaic_bboxes.append([new_cx, new_cy, new_w, new_h, bbox['class_id']])
+
+            mosaic_images.append((paste_x, paste_y, resized))
+
+        # 创建拼接画布并粘贴4个子图
+        canvas = Image.new('RGB', (target_size, target_size), (128, 128, 128))
+        for px, py, sub_img in mosaic_images:
+            canvas.paste(sub_img, (px, py))
+
+        return canvas, mosaic_bboxes
+
+    def _letterbox_single(
+        self,
+        img: Image.Image,
+        orig_w: int,
+        orig_h: int
+    ) -> Tuple[Image.Image, List[List]]:
+        """对单张图做标准letterbox处理（马赛克回退路径）。"""
+        w, h = self.img_size, self.img_size
+        iw, ih = img.size
+        scale = min(w / iw, h / ih)
+        nw, nh = int(iw * scale), int(ih * scale)
+
+        img_resized = img.resize((nw, nh), Image.BILINEAR)
+        new_img = Image.new('RGB', (w, h), (128, 128, 128))
+        offset_x = (w - nw) // 2
+        offset_y = (h - nh) // 2
+        new_img.paste(img_resized, (offset_x, offset_y))
+
+        bboxes = []
+        # 从self.samples中获取当前图的bboxes（需要通过__getitem__上下文）
+        return new_img, bboxes
+
     def _pad_bboxes(self, bboxes: List[List]) -> torch.Tensor:
         """填充边界框到固定大小。
         
@@ -559,24 +798,28 @@ class DefectDataset(Dataset):
 
 
 def create_dataloader(
-    img_dir: str,
-    label_dir: str,
+    img_dir,
+    label_dir,
     mode: str = 'train',
     batch_size: int = None,
     num_workers: int = None,
     preprocess_method: str = None,
-    label_format: str = None
+    label_format: str = None,
+    max_samples_per_dir: int = None,
+    from_end: bool = False,
 ) -> torch.utils.data.DataLoader:
     """创建数据加载器。
     
     Args:
-        img_dir: 图像目录
-        label_dir: 标签目录
+        img_dir: 图像目录（str或list[str]）
+        label_dir: 标签目录（str或list[str]）
         mode: 模式
         batch_size: 批量大小
         num_workers: 工作进程数
         preprocess_method: 预处理方法
         label_format: 标签格式
+        max_samples_per_dir: 每个目录最多加载样本数
+        from_end: 是否从末尾取样本
     
     Returns:
         DataLoader: 数据加载器
@@ -624,7 +867,9 @@ def create_dataloader(
         mode=mode,
         transform=transform,
         preprocess_method=preprocess_method,
-        label_format=label_format
+        label_format=label_format,
+        max_samples_per_dir=max_samples_per_dir,
+        from_end=from_end,
     )
     
     dataloader = torch.utils.data.DataLoader(
@@ -640,13 +885,14 @@ def create_dataloader(
 
 if __name__ == "__main__":
     print("测试数据集加载:")
-    print(f"训练集路径: {config.train_img_dir}")
-    print(f"标签路径: {config.train_label_dir}")
+    print(f"训练集路径: {config.train_img_dirs}")
+    print(f"每子集训练样本数: {config.train_samples_per_subset}")
     
     train_loader = create_dataloader(
-        config.train_img_dir, 
-        config.train_label_dir, 
-        mode='train'
+        config.train_img_dirs, 
+        config.train_label_dirs, 
+        mode='train',
+        max_samples_per_dir=config.train_samples_per_subset,
     )
     
     for img, num_obj, bboxes, meta in train_loader:
