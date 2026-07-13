@@ -46,8 +46,8 @@ from utils import logger
 
 TRAIN_CONFIG = {
     'stage1_epochs': 8,       # [R22] 从20降到8（R21在E9就已收敛，长训练导致过拟合）
-    'stage2_epochs': 30,      # [R22] 从120降到30（快速微调，早停兜底）
-    'early_stop_patience': 10,# [R22] 从30降到10（更快停止，防止过拟合到空间模式）
+    'stage2_epochs': 50,      # [R39] 30→50，让bbox回归有更多学习机会
+    'early_stop_patience': 15,# [R39] 10→15，配合更多epoch
     'stage1_lr': 3e-4,
     'stage2_lr': 3e-5,        # [Round15] 保持微调学习率
     'weight_decay': 5e-4,    # [R27] 从2e-3降到5e-4，减少正则化以加速RPN学习
@@ -966,8 +966,9 @@ def train_one_epoch(model, train_loader, optimizer, rpn_trainer, device, img_siz
         # 用实际有效样本数做平均（排除n_obj=0的空图，避免loss被稀释）
         effective_batch_size = max(num_valid_samples, 1)
         # [Round18] 回退到等权loss（R17的2x bbox权重无益）
+        # [R39] 验证loss也用相同权重，保持训练/验证一致
         batch_loss = (batch_rpn_cls_loss + batch_rpn_bbox_loss +
-                     batch_roi_cls_loss + batch_roi_bbox_loss) / effective_batch_size
+                     batch_roi_cls_loss + 2.0 * batch_roi_bbox_loss) / effective_batch_size
 
         # [Round14修复] 确保batch_loss始终为Tensor（防止全空批次时scaler报错）
         if not isinstance(batch_loss, torch.Tensor):
@@ -1229,8 +1230,10 @@ def validate(model, val_loader, rpn_trainer, device, img_size):
             
             effective_batch_size = max(num_valid_samples, 1)
             # [Round18] 回退到等权
+            # [R39] 增加roi_bbox权重到2.0，强化bbox回归精度
+            # 诊断发现missing漏检IoU=0.47，差0.03过阈值，是bbox回归不足
             batch_loss = (batch_rpn_cls_loss + batch_rpn_bbox_loss +
-                         batch_roi_cls_loss + batch_roi_bbox_loss) / effective_batch_size
+                         batch_roi_cls_loss + 2.0 * batch_roi_bbox_loss) / effective_batch_size
 
             total_loss += batch_loss.item() if hasattr(batch_loss, 'item') else batch_loss
             total_rpn_cls += (batch_rpn_cls_loss.item() if hasattr(batch_rpn_cls_loss, 'item') else batch_rpn_cls_loss) / effective_batch_size
