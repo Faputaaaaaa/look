@@ -915,7 +915,10 @@ class TwoStageDetector(nn.Module):
             labels = labels[valid_box_mask]
 
             # Step 3: score阈值过滤
-            valid_mask = scores > INFERENCE_CONFIG['score_thresh']
+            # [R35] 降低score_thresh从0.3到0.1
+            # RPN score最高仅0.49，ROI softmax概率可能也偏低
+            # 0.1让足够多候选通过，NMS会过滤重复
+            valid_mask = scores > 0.1
 
             final_boxes = refined_boxes[valid_mask]
             final_scores = scores[valid_mask]
@@ -981,9 +984,11 @@ INFERENCE_CONFIG = {
     'rpn_post_nms_top_n': 1000,   # 减少但提高质量(避免R15的2000个噪声proposal)
     'rpn_nms_thresh': 0.7,         # 标准NMS
     'rpn_score_thresh': 0.01,      # [关键] 提高阈值过滤低分anchor(R15用0.003太低)
-    'score_thresh': 0.30,          # 最终分类阈值
-    'nms_thresh': 0.45,            # 最终NMS
-    'max_detections': 15,          # [R27] 恢复到15（项目约束）
+    # [R35] 误检优化：模型过度自信(score全0.99+)，阈值无法区分
+    # 改为：MAX_DET=5(原图每张仅1缺陷) + NMS=0.30(更严格去重)
+    'score_thresh': 0.10,          # 降低阈值让候选通过，靠NMS+MAX_DET控制数量
+    'nms_thresh': 0.30,            # 收紧NMS，合并更多重叠框
+    'max_detections': 5,           # 每张切片最多5个检测（原图每张仅1个缺陷）
 }
 
 
