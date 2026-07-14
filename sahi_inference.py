@@ -64,15 +64,12 @@ def preprocess_crop(crop_img_pil):
     输入: PIL Image (640×640)
     输出: tensor [1,3,640,640]
     """
-    # 转tensor [0,1]
     arr = np.array(crop_img_pil, dtype=np.float32) / 255.0
     if arr.ndim == 2:
         arr = np.stack([arr]*3, axis=-1)
     elif arr.shape[2] == 4:
         arr = arr[:, :, :3]
-    # HWC -> CHW
     t = torch.from_numpy(arr).permute(2, 0, 1)
-    # 标准化
     t = NORMALIZE(t)
     return t.unsqueeze(0).to(DEVICE)
 
@@ -82,15 +79,12 @@ def infer_single_crop(model, crop_tensor):
     """单切片推理，返回切片内预测框列表
     Returns: list of (x1,y1,x2,y2,score,cls_id) 切片内坐标
     """
-    # [R35] 使用model.inference()获取最终检测框
     out = model.inference(crop_tensor)
-    # out是dict: {'boxes': [list of tensors], 'scores': [list], 'labels': [list]}
     boxes_list = out.get('boxes', [])
     scores_list = out.get('scores', [])
     labels_list = out.get('labels', [])
 
     results = []
-    # batch index 0
     if isinstance(boxes_list, list) and len(boxes_list) > 0:
         b_boxes = boxes_list[0]
         b_scores = scores_list[0] if isinstance(scores_list, list) else scores_list
@@ -110,7 +104,7 @@ def infer_single_crop(model, crop_tensor):
             if s < SCORE_THRESH:
                 continue
             c = int(b_labels[i].item()) if isinstance(b_labels, torch.Tensor) else int(b_labels)
-            if c == 0:  # 跳过背景
+            if c == 0:
                 continue
             box = b_boxes[i].cpu().numpy()
             results.append((float(box[0]), float(box[1]), float(box[2]), float(box[3]), s, c))
@@ -124,9 +118,8 @@ def sahi_inference(model, img_path):
     img = Image.open(img_path).convert('RGB')
     iw, ih = img.size
 
-    all_dets = []  # 原图坐标系的所有检测框
+    all_dets = []
 
-    # 滑动窗口
     for y in range(0, ih, STRIDE):
         for x in range(0, iw, STRIDE):
             x2 = min(x + WINDOW, iw)
@@ -136,21 +129,16 @@ def sahi_inference(model, img_path):
             if x2 - x1 < 64 or y2 - y1 < 64:
                 continue
 
-            # 切片
             crop = img.crop((x1, y1, x2, y2))
-            # 如果切片不是640×640，pad到640
             if crop.size != (IMG_SIZE, IMG_SIZE):
                 padded = Image.new('RGB', (IMG_SIZE, IMG_SIZE), (128, 128, 128))
                 padded.paste(crop, (0, 0))
                 crop = padded
 
-            # 推理
             crop_tensor = preprocess_crop(crop)
             crop_dets = infer_single_crop(model, crop_tensor)
 
-            # 坐标映射回原图 + 边界artifact过滤
             for dx1, dy1, dx2, dy2, s, c in crop_dets:
-                # [R35] 过滤切片边界artifact：框贴边(距离<5px)的多为误检
                 edges_touched = 0
                 if dx1 < 5: edges_touched += 1
                 if dy1 < 5: edges_touched += 1
@@ -165,7 +153,6 @@ def sahi_inference(model, img_path):
                 oy2 = dy2 + y1
                 all_dets.append((ox1, oy1, ox2, oy2, s, c))
 
-    # 全局NMS
     if not all_dets:
         return []
 
@@ -173,7 +160,6 @@ def sahi_inference(model, img_path):
     scores = torch.tensor([d[4] for d in all_dets], dtype=torch.float32)
     classes = torch.tensor([d[5] for d in all_dets], dtype=torch.long)
 
-    # 按类别NMS
     final = []
     for cls in classes.unique().tolist():
         mask = classes == cls
@@ -195,23 +181,21 @@ def sahi_inference(model, img_path):
     final.sort(key=lambda x: -x[4])
     final = final[:1]
 
-    # [R40] missing类检测框1.3x扩张
-    # 诊断发现：bbox回归学到缩小的delta，missing检测框系统性偏小50%
-    # (GT 167×91，检测96×74)。1.3x扩张让检测框接近GT，IoU从0.47→0.55+
-    # 实验验证：1.3x最佳(mAP 75%→85%)，1.5x过激(mAP 77.4%)
-    # dirty类不扩张(已准确，扩张会引入FP)
+    # [R40] missing类检测框1.3x扩张 + [R41] dirty类1.1x扩张
+    # R40: missing框系统性偏小50%，1.3x最佳(mAP 75%→86.9%)
+    # R41: dirty类也有轻微偏小，1.1x适度补偿
     EXPAND_MISSING = 1.3
-    EXPAND_DIRTY = 1.0
+    EXPAND_DIRTY = 1.1
     expanded = []
     for x1, y1, x2, y2, s, c in final:
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
         w = x2 - x1
         h = y2 - y1
-        if c == 1:  # missing
+        if c == 1:
             w *= EXPAND_MISSING
             h *= EXPAND_MISSING
-        elif c == 2:  # dirty
+        elif c == 2:
             w *= EXPAND_DIRTY
             h *= EXPAND_DIRTY
         expanded.append((cx - w/2, cy - h/2, cx + w/2, cy + h/2, s, c))
@@ -259,7 +243,6 @@ def evaluate_map(model, max_imgs=50):
     print("SAHI切片推理 mAP评估")
     print(f"{'='*60}")
 
-    # 收集所有测试图片（每个类别均衡采样）
     test_imgs = []
     per_subset = max_imgs // len(SUBSETS)
     for subset in SUBSETS:
@@ -269,29 +252,23 @@ def evaluate_map(model, max_imgs=50):
         for img_file in sorted(img_dir.glob("*.jpg")):
             lbl_file = lbl_dir / f"{img_file.stem}.txt"
             subset_imgs.append((img_file, lbl_file, subset))
-        # 均衡采样
         if len(subset_imgs) > per_subset:
             subset_imgs = subset_imgs[:per_subset]
         test_imgs.extend(subset_imgs)
     print(f"评估图片数: {len(test_imgs)}")
 
-    # 按类别统计
     stats = {name: {'tp': 0, 'fp': 0, 'fn': 0, 'scores': [], 'tps': []} for name in MODEL_CLS_TO_NAME.values()}
 
     for i, (img_file, lbl_file, subset) in enumerate(test_imgs):
         if i % 10 == 0:
             print(f"  进度: {i}/{len(test_imgs)}")
-        # 推理
         dets = sahi_inference(model, str(img_file))
-        # GT
         gts = load_gt(img_file, lbl_file)
 
-        # 按类别匹配
         for cls_name in MODEL_CLS_TO_NAME.values():
             cls_dets = [d for d in dets if MODEL_CLS_TO_NAME.get(d[5]) == cls_name]
             cls_gts = [g for g in gts if g[4] == cls_name]
 
-            # 按score排序
             cls_dets.sort(key=lambda x: -x[4])
 
             matched_gt = set()
@@ -318,7 +295,6 @@ def evaluate_map(model, max_imgs=50):
 
             stats[cls_name]['fn'] += len(cls_gts) - len(matched_gt)
 
-    # 计算指标
     print(f"\n{'='*60}")
     print("mAP结果")
     print(f"{'='*60}")
@@ -328,7 +304,6 @@ def evaluate_map(model, max_imgs=50):
         tp, fp, fn = s['tp'], s['fp'], s['fn']
         precision = tp / max(tp + fp, 1)
         recall = tp / max(tp + fn, 1)
-        # 简化AP: 用PR曲线下面积
         if s['scores']:
             scores = np.array(s['scores'])
             tps = np.array(s['tps'])
@@ -338,7 +313,6 @@ def evaluate_map(model, max_imgs=50):
             cum_fp = np.cumsum(1 - tps)
             precision_arr = cum_tp / np.maximum(cum_tp + cum_fp, 1)
             recall_arr = cum_tp / max(tp + fn, 1)
-            # 简单积分
             ap = np.trapezoid(precision_arr, recall_arr) if len(recall_arr) > 1 else precision
         else:
             ap = 0.0
@@ -356,7 +330,7 @@ def visualize_one(model, img_path, out_path):
     dets = sahi_inference(model, str(img_path))
     img = Image.open(img_path).convert('RGB')
     draw = ImageDraw.Draw(img)
-    COLORS = {'missing': (255, 0, 0), 'dirty': (255, 0, 0)}  # 红框
+    COLORS = {'missing': (255, 0, 0), 'dirty': (255, 0, 0)}
     try:
         font = ImageFont.truetype("arial.ttf", 40)
     except:
@@ -375,9 +349,7 @@ def visualize_one(model, img_path, out_path):
 
 if __name__ == "__main__":
     model = load_model()
-    # 评估mAP
     mAP = evaluate_map(model, max_imgs=50)
-    # 可视化前3张
     print("\n生成可视化...")
     for subset in SUBSETS:
         img_dir = DATA_DIR / subset / "images"
