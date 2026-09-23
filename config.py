@@ -86,17 +86,18 @@ class Config:
     label_format: str = "yolo"
     
     # xinpaide实际只用2类：missing和dirty
+    # 参见 d:\deeplearning\learn\xinpaide\dirty\labels\classes.txt：
+    #   0=ghosting, 1=faint, 2=fuzziness, 3=missing, 4=dirty, 5=scratch, 6=body_scratch
     # YOLO原始ID: missing=3, dirty=4
-    # 重新映射为: missing=0, dirty=1
+    # 重新映射为模型class_id: missing=0, dirty=1
     class_names: List[str] = field(default_factory=lambda: ['missing', 'dirty'])
-    
-    # YOLO原始class_id → 模型class_id
-    # 只映射实际使用的两类
+
+    # 类名 → 模型class_id 映射
+    # 注意：这里key是类名(str)，不是YOLO原始ID(int)。
+    # YOLO原始ID → 类名 → 模型class_id 的转换见 dataset.py:_read_yolo_labels 的 yolo_id_to_name。
     class_name_map: Dict = field(default_factory=lambda: {
-        # YOLO class_id 3 (missing) → 模型class_id 0
-        'missing': 0,
-        # YOLO class_id 4 (dirty) → 模型class_id 1
-        'dirty': 1,
+        'missing': 0,   # YOLO原始ID 3 → 类名 'missing' → 模型class_id 0
+        'dirty': 1,     # YOLO原始ID 4 → 类名 'dirty'  → 模型class_id 1
     })
     
     # 最大目标数量

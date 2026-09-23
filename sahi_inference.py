@@ -22,7 +22,7 @@ from model_fpn import TwoStageDetector, FPN_CONFIG, INFERENCE_CONFIG
 from dataset import DefectDataset
 
 # ============ 配置 ============
-MODEL_PATH = r"experiments\exp_20260706_100732\models\best_model.pth"  # [R35]
+MODEL_PATH = r"experiments\exp_20260812_093621\models\best_model.pth"  # [R40] R40修复后完整训练（早停39/50）
 DATA_DIR = Path(r"d:\deeplearning\learn\xinpaide")
 SUBSETS = ['dirty', 'missing']
 YOLO_ID_TO_NAME = {3: 'missing', 4: 'dirty'}  # 数据集GT id -> name
@@ -49,10 +49,19 @@ def load_model():
     """加载训练好的模型"""
     model = TwoStageDetector(num_classes=len(config.class_names))
     ckpt = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-    if 'model_state_dict' in ckpt:
-        model.load_state_dict(ckpt['model_state_dict'])
-    else:
-        model.load_state_dict(ckpt)
+    state_dict = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
+    # [R40] strict=False：旧权重可能没有 residual_proj（新加的残差投影层）
+    # 该层零初始化时 residual=0，输出与旧模型完全一致，可安全加载。
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        # 过滤掉roi_head.residual_proj（预期缺失，零初始化）
+        real_missing = [k for k in missing if 'residual_proj' not in k]
+        if real_missing:
+            print(f"[警告] 缺失非residual_proj的key: {real_missing}")
+        else:
+            print(f"[info] residual_proj 用零初始化（旧权重无此参数），输出与旧模型一致")
+    if unexpected:
+        print(f"[警告] 意外key: {unexpected}")
     model.to(DEVICE)
     model.eval()
     print(f"模型加载: {MODEL_PATH}")
@@ -237,10 +246,14 @@ def compute_iou(box1, box2):
     return inter / max(union, 1e-6)
 
 
-def evaluate_map(model, max_imgs=50):
-    """评估mAP"""
+def evaluate_map(model, max_imgs=50, split='val'):
+    """评估mAP
+
+    [R40] split='val' 取后N张（验证集，未参与训练）；split='train' 取前N张（训练集，仅用于过拟合诊断）。
+    之前固定取前25张导致 93.9% mAP 是训练集自评，不能反映泛化能力。
+    """
     print(f"\n{'='*60}")
-    print("SAHI切片推理 mAP评估")
+    print(f"SAHI切片推理 mAP评估  [split={split}]")
     print(f"{'='*60}")
 
     test_imgs = []
@@ -253,9 +266,14 @@ def evaluate_map(model, max_imgs=50):
             lbl_file = lbl_dir / f"{img_file.stem}.txt"
             subset_imgs.append((img_file, lbl_file, subset))
         if len(subset_imgs) > per_subset:
-            subset_imgs = subset_imgs[:per_subset]
+            if split == 'val':
+                # 取后N张（验证集，未参与训练）
+                subset_imgs = subset_imgs[-per_subset:]
+            else:
+                # 取前N张（训练集，用于诊断过拟合）
+                subset_imgs = subset_imgs[:per_subset]
         test_imgs.extend(subset_imgs)
-    print(f"评估图片数: {len(test_imgs)}")
+    print(f"评估图片数: {len(test_imgs)}  (split={split})")
 
     stats = {name: {'tp': 0, 'fp': 0, 'fn': 0, 'scores': [], 'tps': []} for name in MODEL_CLS_TO_NAME.values()}
 
@@ -325,35 +343,121 @@ def evaluate_map(model, max_imgs=50):
     return mAP
 
 
-def visualize_one(model, img_path, out_path):
-    """可视化单张图"""
+def visualize_one(model, img_path, out_path, gt_path=None):
+    """可视化单张图：将预测框（红）和GT原缺陷位置框（绿）画在同一张图上。
+
+    [R40] 之前只画预测框，难以直观判断 IoU / 漏检 / 误检。
+    现在GT和预测同图对比：
+      - 红色实线框  = 预测框（含 score）
+      - 绿色虚线框  = GT 真实缺陷位置
+      - 左上角图例  = 颜色说明
+
+    Args:
+        model: 已加载的模型
+        img_path: 原图路径
+        out_path: 输出图片路径
+        gt_path: GT标签文件路径（YOLO格式）。None时自动从img_path推断：
+                 .../{subset}/images/frame_xxxx.jpg → .../{subset}/labels/frame_xxxx.txt
+    """
     dets = sahi_inference(model, str(img_path))
     img = Image.open(img_path).convert('RGB')
+    img_w, img_h = img.size
     draw = ImageDraw.Draw(img)
-    COLORS = {'missing': (255, 0, 0), 'dirty': (255, 0, 0)}
+
+    # 字体
     try:
         font = ImageFont.truetype("arial.ttf", 40)
+        font_small = ImageFont.truetype("arial.ttf", 30)
     except:
         font = ImageFont.load_default()
+        font_small = font
 
+    # ===== 1. 画GT框（绿色虚线） =====
+    # YOLO标签: class_id cx cy w h（归一化到原图）
+    # 数据集 classes.txt: 3=missing, 4=dirty
+    if gt_path is None:
+        # 自动推断: images/xxx.jpg → labels/xxx.txt
+        img_path = Path(img_path)
+        subset = img_path.parent.parent.name  # 'dirty' or 'missing'
+        label_dir = DATA_DIR / subset / "labels"
+        gt_path = label_dir / f"{img_path.stem}.txt"
+
+    gt_boxes = []
+    if Path(gt_path).exists():
+        with open(gt_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) < 5:
+                    continue
+                yolo_id = int(parts[0])
+                cx, cy, bw, bh = map(float, parts[1:5])
+                # 归一化 → 原图像素
+                px_cx = cx * img_w
+                px_cy = cy * img_h
+                px_w = bw * img_w
+                px_h = bh * img_h
+                x1 = px_cx - px_w / 2
+                y1 = px_cy - px_h / 2
+                x2 = px_cx + px_w / 2
+                y2 = px_cy + px_h / 2
+                gt_name = YOLO_ID_TO_NAME.get(yolo_id, f"id{yolo_id}")
+                gt_boxes.append((x1, y1, x2, y2, gt_name))
+
+    GT_COLOR = (0, 255, 0)  # 绿色 = GT
+    for x1, y1, x2, y2, name in gt_boxes:
+        # 虚线效果：通过画多个短矩形模拟（Pillow无内置dashed）
+        # 这里用粗实线 + 不同颜色区分，比虚线更清晰
+        draw.rectangle([x1, y1, x2, y2], outline=GT_COLOR, width=8)
+        # GT标签放在框左下角，避免和预测标签（左上角）冲突
+        draw.text((x1, min(img_h - 50, y2 + 5)), f"GT: {name}",
+                  fill=GT_COLOR, font=font_small)
+
+    # ===== 2. 画预测框（红色实线） =====
+    PRED_COLOR = (255, 0, 0)  # 红色 = 预测
     for det in dets:
         x1, y1, x2, y2, s, c = det
         name = MODEL_CLS_TO_NAME.get(c, str(c))
-        color = COLORS.get(name, (255, 0, 0))
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=5)
-        draw.text((x1, max(0, y1-45)), f"{name} {s:.2f}", fill=color, font=font)
+        draw.rectangle([x1, y1, x2, y2], outline=PRED_COLOR, width=5)
+        # 预测标签放在框左上角
+        draw.text((x1, max(0, y1 - 45)), f"{name} {s:.2f}",
+                  fill=PRED_COLOR, font=font)
+
+    # ===== 3. 左上角图例 =====
+    legend_x, legend_y = 20, 20
+    legend_w, legend_h = 50, 20
+    # 红色方块 + "Prediction"
+    draw.rectangle([legend_x, legend_y, legend_x + legend_w, legend_y + legend_h],
+                   outline=PRED_COLOR, width=4)
+    draw.text((legend_x + legend_w + 10, legend_y - 5), "Prediction",
+              fill=PRED_COLOR, font=font_small)
+    # 绿色方块 + "Ground Truth"
+    draw.rectangle([legend_x, legend_y + 50, legend_x + legend_w, legend_y + 50 + legend_h],
+                   outline=GT_COLOR, width=4)
+    draw.text((legend_x + legend_w + 10, legend_y + 45), "Ground Truth",
+              fill=GT_COLOR, font=font_small)
+
+    # ===== 4. 标题信息 =====
+    n_pred = len(dets)
+    n_gt = len(gt_boxes)
+    info = f"P:{n_pred}  GT:{n_gt}"
+    draw.text((img_w - 350, 20), info, fill=(255, 255, 255), font=font)
 
     img.save(out_path)
-    print(f"可视化保存: {out_path}")
+    print(f"可视化保存: {out_path}  (预测={n_pred}, GT={n_gt})")
 
 
 if __name__ == "__main__":
     model = load_model()
-    mAP = evaluate_map(model, max_imgs=50)
-    print("\n生成可视化...")
+    # [R40] 评估用验证集（后20张），不再用训练集前25张自评
+    mAP = evaluate_map(model, max_imgs=50, split='val')
+    print("\n生成可视化（验证集）...")
     for subset in SUBSETS:
         img_dir = DATA_DIR / subset / "images"
-        imgs = sorted(img_dir.glob("*.jpg"))[:2]
+        # [R40] 取后2张（验证集），不再取前2张（训练集）
+        imgs = sorted(img_dir.glob("*.jpg"))[-2:]
         for img_file in imgs:
-            out = f"r35_vis_{subset}_{img_file.name}"
+            out = f"r40_vis_{subset}_{img_file.name}"
             visualize_one(model, str(img_file), out)
