@@ -30,7 +30,6 @@ from pathlib import Path
 from config import config
 from model_fpn import (
     TwoStageDetector,
-    FocalLoss,
     CIoULoss,
     FPN_CONFIG,  # [Round15] 导入FPN配置(用于动态anchor数)
     INFERENCE_CONFIG
@@ -183,97 +182,65 @@ def encode_boxes(gt_boxes: torch.Tensor, proposals: torch.Tensor) -> torch.Tenso
     return torch.stack([dx, dy, dw, dh], dim=1)
 
 
-def multi_class_focal_loss(cls_logits: torch.Tensor, targets: torch.Tensor,
-                           alpha=None, gamma: float = 2.0) -> torch.Tensor:
-    """Sigmoid-per-class多分类Focal Loss（支持正/负样本区分 + 类别加权）。
+def clip_grad_norm_grouped(model: TwoStageDetector,
+                           rpn_max_norm: float = 5.0,
+                           roi_max_norm: float = 1.0):
+    """[R40] 分组梯度裁剪：RPN 用较大阈值，ROI Head 用严格阈值。
 
-    与softmax版本的关键区别：
-    - 每个前景类独立做sigmoid二分类，不受background类概率压制
-    - 正样本：对匹配类别计算FL，鼓励该类高概率
-    - 负样本（背景）：对所有类计算FL，鼓励所有类低概率（取最高置信类作为锚点）
-    - 支持per-class alpha：对少数类提高权重，对多数类降低权重
-    - 这与inference()中使用的Sigmoid-per-class策略完全一致
+    设计理由：
+    - RPN 正样本极度稀疏（百万级 anchors 中 1-40 个正样本），梯度信号本就微弱，
+      max_norm=1.0 会过度压缩有效梯度，导致 RPN 学不动（[R28] 已验证）。
+      → 用 5.0 给 RPN 足够的梯度空间。
+    - ROI Head 的 bbox 回归需要高精度（IoU 目标 0.7），梯度抖动会直接导致 box 不稳。
+      → 用 1.0 严格限制，符合 project_memory 硬约束。
+    - 二者解耦后，RPN 学习不被压制，ROI 精修不被抖动干扰。
 
     Args:
-        cls_logits: [N, num_classes] 前景类logits（不含background，与ROI Head输出[:, 1:]对齐）
-        targets: [N] 类别标签（0~num_classes-1表示前景类，-1表示背景/负样本）
-        alpha: 平衡因子（标量或[num_classes]向量）。None则自动按频率反比计算。
-        gamma: 聚焦参数
+        model: TwoStageDetector
+        rpn_max_norm: RPN 参数的梯度范数上限
+        roi_max_norm: ROI Head 参数的梯度范数上限
+
+    Returns:
+        (rpn_grad_norm, roi_grad_norm): 裁剪前各自的梯度范数，用于诊断
     """
-    num_classes = cls_logits.size(1)
+    rpn_params = []
+    roi_params = []
+    other_params = []  # backbone + FPN
 
-    # 自动计算类别权重（频率反比）：少数类获得更高权重
-    if alpha is None or isinstance(alpha, (int, float)):
-        # 统计当前batch中各类别的出现次数（仅正样本）
-        pos_mask = targets >= 0
-        if pos_mask.any():
-            class_counts = torch.zeros(num_classes, device=cls_logits.device)
-            for c in range(num_classes):
-                class_counts[c] = (targets[pos_mask] == c).sum().item()
-            # 频率反比 + 平滑：避免除零和极端值
-            freq = class_counts / (class_counts.sum() + 1e-6)
-            # 有效类别数 = 实际出现的类别数
-            num_valid = (class_counts > 0).sum().item()
-            # alpha = 1 / (freq * num_valid)，使所有类的总权重平衡
-            alpha_per_class = 1.0 / (freq.clamp(min=1e-4) * max(num_valid, 1))
-            # 归一化使均值≈1
-            alpha_per_class = alpha_per_class / alpha_per_class.mean()
+    for name, p in model.named_parameters():
+        if not p.requires_grad or p.grad is None:
+            continue
+        if 'rpn.' in name:
+            rpn_params.append(p)
+        elif 'roi_head.' in name:
+            roi_params.append(p)
         else:
-            alpha_per_class = torch.ones(num_classes, device=cls_logits.device)
-    else:
-        alpha_per_class = alpha
+            # backbone / FPN 归入 "其他"，用 ROI 的严格阈值（保护预训练权重）
+            other_params.append(p)
 
-    # 每个类别独立sigmoid（与inference()一致）
-    probs = torch.sigmoid(cls_logits).clamp(1e-6, 1.0 - 1e-6)
+    rpn_grad_norm = torch.nn.utils.clip_grad_norm_(rpn_params, max_norm=rpn_max_norm).item() \
+        if rpn_params else 0.0
+    roi_grad_norm = torch.nn.utils.clip_grad_norm_(roi_params, max_norm=roi_max_norm).item() \
+        if roi_params else 0.0
+    # backbone+FPN 用 ROI 阈值（与 ROI 一致，保护预训练权重不被破坏）
+    if other_params:
+        torch.nn.utils.clip_grad_norm_(other_params, max_norm=roi_max_norm)
 
-    # 分离正样本和负样本（背景）
-    pos_mask = targets >= 0
-    neg_mask = ~pos_mask
+    return rpn_grad_norm, roi_grad_norm
 
-    total_loss = None
 
-    # 正样本：标准Focal Loss（对匹配类别，鼓励高概率）
-    if pos_mask.any():
-        pos_probs = probs[pos_mask]
-        pos_targets = targets[pos_mask]
+def multi_class_focal_loss(cls_logits: torch.Tensor, targets: torch.Tensor,
+                           alpha=None, gamma: float = 2.0) -> torch.Tensor:
+    """[R40已弃用] Sigmoid-per-class Focal Loss。
 
-        # 取出每个正样本其真实类别的概率 p_t
-        pt = pos_probs.gather(1, pos_targets.unsqueeze(1)).squeeze(1)
-
-        # 【关键修复】使用per-class alpha：对少数类提高权重
-        pos_alpha = alpha_per_class[pos_targets]
-
-        # Focal权重: (1-pt)^gamma — 对易分类样本降权
-        focal_weight = (1 - pt) ** gamma
-
-        # 交叉熵: -log(pt)
-        ce_loss = -torch.log(pt)
-
-        pos_loss = pos_alpha * focal_weight * ce_loss
-        total_loss = pos_loss.sum()
-
-    # 负样本（背景）：Focal Loss（对所有类，鼓励低概率）
-    # 策略：取最高置信度的类别作为"最难负样本"（RetinaNet风格OHEM-lite）
-    if neg_mask.any():
-        neg_probs = probs[neg_mask]  # [N_neg, C]
-
-        # 负样本最自信的错误预测概率（越高说明模型越确信错误答案）
-        neg_pt = neg_probs.max(dim=1)[0]  # 最高的错误概率
-
-        # 对于负样本：希望概率→0，所以用 neg_pt 作为"错误"概率
-        # FL_neg = -(neg_pt)^gamma * log(1 - neg_pt)
-        neg_loss = neg_pt.pow(gamma) * torch.log(
-            (1 - neg_pt).clamp(min=1e-6)
-        )
-        # 注意：log(1-neg_pt) < 0，前面加负号使loss > 0
-        neg_loss = -neg_loss
-
-        if total_loss is not None:
-            total_loss = total_loss + neg_loss.sum()
-        else:
-            total_loss = neg_loss.sum()
-
-    return total_loss / cls_logits.size(0)
+    历史用途：早期 [Round14-18] 用于 ROI 分类，[Round19] 起改为 CrossEntropyLoss 启用类间竞争。
+    函数体已删除（清理死代码），如需恢复请查阅 git 历史 R39 版本。
+    """
+    raise NotImplementedError(
+        "multi_class_focal_loss 已弃用 (R40)。"
+        "ROI 分类实际使用 F.cross_entropy (train.py:949)，"
+        "符合 project_memory 中 'CrossEntropy Loss 必须用于分类' 的硬约束。"
+    )
 
 
 # ============================================================
@@ -979,15 +946,17 @@ def train_one_epoch(model, train_loader, optimizer, rpn_trainer, device, img_siz
         if scaler is not None:
             # AMP: 缩放loss防止FP16下溢，自动处理混合精度反向传播
             scaler.scale(batch_loss).backward()
-            # 梯度裁剪（在unscale之前执行，避免裁剪被缩放的梯度）
+            # [R40] 分组梯度裁剪（在unscale之后执行）
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)  # [R28] 1.0→5.0
+            rpn_gn, roi_gn = clip_grad_norm_grouped(model, rpn_max_norm=5.0, roi_max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             batch_loss.backward()
-            # 梯度裁剪：防止大锚框回归时梯度爆炸
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)  # [R28] 1.0→5.0
+            # [R40] 分组梯度裁剪：RPN 用 5.0（梯度信号弱需空间），ROI Head 用 1.0（bbox精修需稳定）
+            # 取代旧的统一 max_norm=5.0：既满足 project_memory 硬约束（1.0 for bbox精修），
+            # 又不让 RPN 学不动（[R28] 经验）。
+            rpn_gn, roi_gn = clip_grad_norm_grouped(model, rpn_max_norm=5.0, roi_max_norm=1.0)
             optimizer.step()
         
         total_loss += batch_loss.item() if hasattr(batch_loss, 'item') else batch_loss
@@ -1191,42 +1160,66 @@ def validate(model, val_loader, rpn_trainer, device, img_size):
                 num_pos = min(roi_pos_mask.sum().item(), 32)
                 num_neg = min(roi_neg_mask.sum().item(), num_pos * 3)
 
-                if num_pos > 0 and num_neg > 0:
+                # [R40] num_pos==0 保底：与训练阶段 (train.py:901-921) 完全一致
+                # 之前验证阶段没有保底，空批次被直接跳过，导致验证loss系统性偏低（不计入分母）。
+                # 现在取IoU最高的5个proposal作为正样本，让验证loss反映真实分布。
+                if num_pos == 0:
+                    roi_max_ious = max_ious[roi_orig_indices]
+                    top_k = min(5, roi_max_ious.size(0))
+                    if top_k == 0:
+                        continue
+                    _, top_iou_inds = roi_max_ious.topk(top_k)
+                    pos_inds = top_iou_inds
+                    num_pos = top_k
+                    num_neg = min(roi_neg_mask.sum().item(), num_pos * 3)
+                    if num_neg == 0:
+                        # 负样本也没有，随机抽
+                        all_inds = torch.arange(roi_features.size(0), device=device)
+                        perm = torch.randperm(all_inds.size(0), device=device)[:min(num_pos * 3, all_inds.size(0))]
+                        neg_inds = all_inds[perm]
+                    else:
+                        raw_neg_inds_val = torch.where(roi_neg_mask)[0]
+                        if raw_neg_inds_val.size(0) > num_neg:
+                            perm = torch.randperm(raw_neg_inds_val.size(0), device=device)[:num_neg]
+                            neg_inds = raw_neg_inds_val[perm]
+                        else:
+                            neg_inds = raw_neg_inds_val
+                else:
                     pos_inds = torch.where(roi_pos_mask)[0][:num_pos]
-                    # [R12-B基线] 验证也使用随机负采样（与训练一致）
                     raw_neg_inds_val = torch.where(roi_neg_mask)[0]
                     if raw_neg_inds_val.size(0) > num_neg:
                         perm = torch.randperm(raw_neg_inds_val.size(0), device=device)[:num_neg]
                         neg_inds = raw_neg_inds_val[perm]
                     else:
                         neg_inds = raw_neg_inds_val
-                    sampled_inds = torch.cat([pos_inds, neg_inds])
 
-                    sampled_cls_logits = cls_logits[sampled_inds]
-                    sampled_gt_labels = torch.zeros(len(sampled_inds), dtype=torch.long, device=device)
-                    orig_pos_indices = roi_orig_indices[pos_inds]
-                    sampled_gt_labels[:len(pos_inds)] = gt_class_ids_val[matched_gt_idx[orig_pos_indices]] + 1
+                sampled_inds = torch.cat([pos_inds, neg_inds])
 
-                    # [Round19] CrossEntropyLoss（与训练一致，带类别权重）
-                    if hasattr(model, '_cls_weight'):
-                        roi_cls_loss = F.cross_entropy(sampled_cls_logits, sampled_gt_labels,
-                                                       weight=model._cls_weight)
-                    else:
-                        roi_cls_loss = F.cross_entropy(sampled_cls_logits, sampled_gt_labels)
+                sampled_cls_logits = cls_logits[sampled_inds]
+                sampled_gt_labels = torch.zeros(len(sampled_inds), dtype=torch.long, device=device)
+                orig_pos_indices = roi_orig_indices[pos_inds]
+                sampled_gt_labels[:len(pos_inds)] = gt_class_ids_val[matched_gt_idx[orig_pos_indices]] + 1
 
-                    if len(pos_inds) > 0:
-                        pos_proposals = proposals[roi_orig_indices[pos_inds]]
-                        pos_gt_boxes = gt_boxes[matched_gt_idx[roi_orig_indices[pos_inds]]]
-                        # [Round19] 共享4维delta，直接使用
-                        pos_bbox_deltas = bbox_deltas[pos_inds]
+                # [Round19] CrossEntropyLoss（与训练一致，带类别权重）
+                if hasattr(model, '_cls_weight'):
+                    roi_cls_loss = F.cross_entropy(sampled_cls_logits, sampled_gt_labels,
+                                                   weight=model._cls_weight)
+                else:
+                    roi_cls_loss = F.cross_entropy(sampled_cls_logits, sampled_gt_labels)
 
-                        pred_boxes = model.decode_boxes(pos_proposals, pos_bbox_deltas, img_w=img_size, img_h=img_size)
-                        roi_bbox_loss = CIoULoss()(pred_boxes, pos_gt_boxes)
-                    else:
-                        roi_bbox_loss = torch.tensor(0.0, device=device)
-                    
-                    batch_roi_cls_loss = batch_roi_cls_loss + roi_cls_loss
-                    batch_roi_bbox_loss = batch_roi_bbox_loss + roi_bbox_loss
+                if len(pos_inds) > 0:
+                    pos_proposals = proposals[roi_orig_indices[pos_inds]]
+                    pos_gt_boxes = gt_boxes[matched_gt_idx[roi_orig_indices[pos_inds]]]
+                    # [Round19] 共享4维delta，直接使用
+                    pos_bbox_deltas = bbox_deltas[pos_inds]
+
+                    pred_boxes = model.decode_boxes(pos_proposals, pos_bbox_deltas, img_w=img_size, img_h=img_size)
+                    roi_bbox_loss = CIoULoss()(pred_boxes, pos_gt_boxes)
+                else:
+                    roi_bbox_loss = torch.tensor(0.0, device=device)
+
+                batch_roi_cls_loss = batch_roi_cls_loss + roi_cls_loss
+                batch_roi_bbox_loss = batch_roi_bbox_loss + roi_bbox_loss
             
             effective_batch_size = max(num_valid_samples, 1)
             # [Round18] 回退到等权
@@ -1404,11 +1397,13 @@ def main():
         num_anchors = len(cfg['scales']) * len(cfg['ratios'])
         print(f"  {layer}: stride={cfg['stride']}, anchors/位置={num_anchors}")
     print("\n[损失函数（已统一）]")
-    print(f"  RPN 分类: Focal Loss (alpha=0.25, gamma=2.0)")
+    print(f"  RPN 分类: BCEWithLogitsLoss (train.py:639)")
     print(f"  RPN 回归: CIoU Loss (绝对坐标空间)")
-    print(f"  ROI 分类: Focal Loss (alpha=auto, gamma=1.5, 多分类)")
+    print(f"  ROI 分类: CrossEntropyLoss (类间竞争, train.py:949)")
     print(f"  ROI 回归: CIoU Loss (绝对坐标空间)")
-    print(f"  梯度裁剪: max_norm=1.0")
+    print(f"  梯度裁剪: [R40] 分组裁剪 RPN=5.0 / ROI+Backbone=1.0")
+    print(f"  数据增强: [R40] 水平/垂直翻转 + ColorJitter (滑动窗口路径)")
+    print(f"  ROI残差:  [R40] residual_proj 投影层已启用")
     print("=" * 60)
     
     # 加载数据

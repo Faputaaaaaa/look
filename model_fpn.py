@@ -7,9 +7,13 @@
 3. RPN: 区域提议网络
 4. ROI Head: 检测头（分类+回归精修）
 
-损失函数：
-- Focal Loss (分类)
-- CIoU Loss (回归)
+实际生效的损失函数（在 train.py 中计算）：
+- RPN cls: BCEWithLogitsLoss (train.py:639) — [R35] Focal Loss/加权BCE均未解决spatial bias后回退
+- RPN bbox: CIoU Loss (train.py:650)
+- ROI cls: CrossEntropyLoss (train.py:949) — [Round19] 替代FocalLoss启用类间竞争（项目硬约束）
+- ROI bbox: CIoU Loss (train.py:959, 1224)
+
+注意：早期版本的 FocalLoss 类已删除（[R40]清理），实际未参与训练。
 """
 
 import torch
@@ -26,45 +30,9 @@ from utils import logger
 # 损失函数
 # ============================================================
 
-class FocalLoss(nn.Module):
-    """Focal Loss用于分类。
-    
-    FL(p) = -α(1-p)^γ * log(p)    (正样本)
-    FL(p) = -(1-α)p^γ * log(1-p)  (负样本)
-    
-    Args:
-        alpha: 正样本权重
-        gamma: 聚焦参数
-    """
-    
-    def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-    
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            pred: [N,] 预测概率 (0-1)
-            target: [N,] 目标标签 (0或1)
-        
-        Returns:
-            loss: 标量损失
-        """
-        pred = pred.clamp(1e-6, 1 - 1e-6)
-        
-        # 正样本损失
-        pos_mask = target == 1
-        pos_loss = -self.alpha * (1 - pred[pos_mask]) ** self.gamma * torch.log(pred[pos_mask])
-        
-        # 负样本损失
-        neg_mask = target == 0
-        neg_loss = -(1 - self.alpha) * pred[neg_mask] ** self.gamma * torch.log(1 - pred[neg_mask])
-        
-        loss = pos_loss.sum() + neg_loss.sum()
-        num_samples = pos_mask.sum() + neg_mask.sum()
-        
-        return loss / max(num_samples, 1)
+# [R40] FocalLoss 类已删除：项目实际未使用（RPN cls用BCEWithLogits，ROI cls用CrossEntropy）
+# 早期 [Round 5-18] 实验过Focal Loss，[R35] 后回退BCE，[Round19] ROI改CrossEntropy启用类间竞争。
+# 历史经验保留在 project_memory 中以防回退。
 
 
 class CIoULoss(nn.Module):
@@ -429,6 +397,12 @@ class ROIHead(nn.Module):
             nn.Dropout(0.3),  # [R21] 从0.5降到0.3，保留更多信息
         )
 
+        # [R40] 残差投影：input(in_flat_dim) → hidden_dim，让 shared + proj 真正生效
+        # 之前注释说"维度不匹配所以跳过"，残差连接形同虚设。
+        # 补上 1×1 Linear 投影后：shared = shared_fc(x)；out = shared + proj(x)
+        # 这样输入信息能绕过 shared_fc 直接流向 cls/bbox 分支，保护梯度流。
+        self.residual_proj = nn.Linear(self.in_flat_dim, hidden_dim)
+
         # ============ 分类分支 ============
         self.cls_branch = nn.Sequential(
             nn.GroupNorm(num_groups=16, num_channels=hidden_dim),  # 输入归一化
@@ -462,6 +436,10 @@ class ROIHead(nn.Module):
                 nn.init.constant_(m.weight, 1.0)
                 nn.init.constant_(m.bias, 0.0)
 
+        # [R40] 残差投影初始化为零（残差分支初始为恒等映射，训练初期不破坏shared_fc的输出）
+        nn.init.zeros_(self.residual_proj.weight)
+        nn.init.zeros_(self.residual_proj.bias)
+
         # 分类头BG偏好初始化
         bg_prior = 0.85
         bias_value = -np.log((1 - bg_prior) / bg_prior)
@@ -487,7 +465,12 @@ class ROIHead(nn.Module):
 
         shared = self.shared_fc(x)
 
-        # [R21] 轻量残差：如果维度匹配则相加（这里不匹配所以用投影或跳过）
+        # [R40] 真正生效的残差连接：输入投影到 hidden_dim 后加到 shared 上
+        # 残差投影权重初始化为0，训练初期 shared 不变，避免破坏 R21 已验证的收敛行为；
+        # 后续训练会让 proj 逐步学习到补充信息。
+        residual = self.residual_proj(x)
+        shared = shared + residual
+
         cls_pred = self.cls_branch(shared)
         bbox_pred = self.bbox_branch(shared)
 
@@ -533,12 +516,12 @@ class TwoStageDetector(nn.Module):
         
         # ROI Head
         self.roi_head = ROIHead(in_channels=256, num_classes=self.num_classes)
-        
-        # 损失函数
-        self.rpn_cls_loss = FocalLoss(alpha=0.25, gamma=2.0)  # RPN: 标准参数
-        self.rpn_bbox_loss = CIoULoss()
-        self.roi_cls_loss = FocalLoss(alpha=0.5, gamma=2.0)   # ROI: 调整参数
-        self.roi_bbox_loss = CIoULoss()
+
+        # [R40] 损失函数实例已删除：实际损失计算在 train.py 中
+        # RPN cls: BCEWithLogitsLoss (train.py:639)
+        # RPN bbox: CIoULoss (train.py:650, RPNTrainer.compute_loss)
+        # ROI cls: CrossEntropyLoss (train.py:949)
+        # ROI bbox: CIoULoss (train.py:959)
     
     def extract_features(self, x: torch.Tensor) -> List[torch.Tensor]:
         """提取ResNet多层特征。"""

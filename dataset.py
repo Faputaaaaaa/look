@@ -469,22 +469,51 @@ class DefectDataset(Dataset):
         return img_tensor, torch.tensor(num_objects, dtype=torch.long), bboxes_padded, meta
     
     def _process_sliding_window(
-        self, 
-        img: Image.Image, 
+        self,
+        img: Image.Image,
         sample: Dict
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
-        """滑动窗口处理。"""
+        """滑动窗口处理。
+
+        [R40] 启用数据增强（仅bbox-safe操作：水平/垂直翻转 + ColorJitter）。
+        - 不启用RandomCrop：dirty占切片43%，crop后可能切掉缺陷
+        - 不启用马赛克：4图拼接会让dirty占满整图，破坏缺陷尺度分布
+        - 翻转和颜色增强不破坏bbox坐标（仅翻转需对称翻转cx/cy）
+        """
         window = sample['window']
-        
+
         img_cropped = img.crop((
-            window['x'], 
-            window['y'], 
-            window['x'] + window['w'], 
+            window['x'],
+            window['y'],
+            window['x'] + window['w'],
             window['y'] + window['h']
         ))
-        
+
         img_resized = img_cropped.resize((self.img_size, self.img_size))
-        
+
+        # 收集bbox（归一化坐标，0~1相对切片）
+        bboxes = []
+        for bbox in sample['all_bboxes']:
+            bboxes.append([bbox['cx'], bbox['cy'], bbox['w'], bbox['h'], bbox['class_id']])
+        num_objects = len(bboxes)
+
+        # [R40] 训练模式启用bbox-safe数据增强
+        # 注意：滑动窗口路径下bbox已经是0~1归一化坐标，翻转操作直接镜像cx/cy即可
+        if self.mode == 'train' and config.use_augmentation:
+            # 水平翻转 p=0.5
+            if random.random() < 0.5:
+                img_resized = img_resized.transpose(Image.FLIP_LEFT_RIGHT)
+                bboxes = [[1.0 - b[0], b[1], b[2], b[3], b[4]] for b in bboxes]
+
+            # 垂直翻转 p=0.3（瓶身无方向偏置，可启用）
+            if random.random() < 0.3:
+                img_resized = img_resized.transpose(Image.FLIP_TOP_BOTTOM)
+                bboxes = [[b[0], 1.0 - b[1], b[2], b[3], b[4]] for b in bboxes]
+
+            # 颜色增强（不影响bbox）
+            if self.color_transform:
+                img_resized = self.color_transform(img_resized)
+
         # 使用新的transform结构
         if hasattr(self, 'normalize_transform') and self.normalize_transform:
             img_tensor = self.normalize_transform(img_resized)
@@ -492,20 +521,15 @@ class DefectDataset(Dataset):
             img_tensor = self.transform(img_resized)
         else:
             img_tensor = transforms.ToTensor()(img_resized)
-        
-        bboxes = []
-        for bbox in sample['all_bboxes']:
-            bboxes.append([bbox['cx'], bbox['cy'], bbox['w'], bbox['h'], bbox['class_id']])
-        
-        num_objects = len(bboxes)
+
         bboxes_padded = self._pad_bboxes(bboxes)
-        
+
         meta = {
             'img_path': sample['img_path'],
             'window': window,
             'original_size': img.size
         }
-        
+
         return img_tensor, torch.tensor(num_objects, dtype=torch.long), bboxes_padded, meta
     
     def _process_resize(
