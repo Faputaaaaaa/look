@@ -3,7 +3,7 @@
 > 记录当前进度，供下次新会话快速恢复。恢复时先读本文件 + CLAUDE.md + DECISIONS.md。
 
 ## 当前阶段
-**P0.1/P0.2/P0.3 + AP 标准实现 已完成**，接下来 P0.4（背景窗口参与 RPN）。今日（2026-09-24）时间盒：11:45～13:30，只做可中断低风险任务。
+**P0.1–P0.4 + AP 标准实现 已完成**，接下来 P0.5（统一 proposal 提取）。今日（2026-09-24）时间盒：11:45～13:30，只做可中断低风险任务。
 
 ## 已完成
 - 通读 6 个核心文件（config / utils / model_fpn / dataset / train / sahi_inference，共约 4300 行）和 5 个诊断脚本。
@@ -25,6 +25,10 @@
 - **AP 标准实现**（用户确认）：`evaluate_map` 用 VOC all-point AP，锚定 recall=0（precision 补 1）、recall=1（precision 补 0）。
   - 新增 `voc_ap()` 助手；冒烟测试纯 TP 得 AP=1.0（旧版 np.trapezoid 只得 0.75）。
   - **注意：改后 AP/mAP 数字不可与旧版直接比，旧版系统性偏低。**
+- **P0.4** 背景窗口参与 RPN 分类损失（`train.py:train_one_epoch`）。
+  - 旧：`n_obj==0` 整个跳过背景窗口，负样本没参与训练。新：空 GT 参与 RPN cls/bbox 损失，跳过 ROI Head；`num_valid_samples` 计入背景窗口。
+  - 冒烟测试通过：12 窗口前向+反向，total_loss=5.81 无 NaN。
+  - 注意：背景窗口 RPN 负样本目前是全量负 anchor（`sample_anchors` num_pos=0 时不截断），需加日志监控（见 P1）。
 
 ## 未完成（按优先级）
 
@@ -32,7 +36,7 @@
 - ~~**P0.1** 按原图 80/20 划分 train/val，`seed=42`，落盘 `split.json`。~~ ✅ 已完成
 - ~~**P0.2** 修 mAP 评估 train/val 泄露（`sahi_inference.py:evaluate_map`：改为只读 `split.json` 的 val 原图）。~~ ✅ 已完成
 - ~~**P0.3** 修 warmup（`WarmupCosineScheduler` 真正更新两个参数组 lr，而非只改日志）。~~ ✅ 已完成
-- **P0.4** 背景窗口参与 RPN 分类损失，ROI 正样本跳过（改 `train.py` 的 `n_obj==0` 跳过逻辑）。
+- ~~**P0.4** 背景窗口参与 RPN 分类损失，ROI 正样本跳过（改 `train.py` 的 `n_obj==0` 跳过逻辑）。~~ ✅ 已完成
 - **P0.5** 统一 proposal 提取逻辑（train / validate / inference 三处重复，抽成公共函数）。
 
 ### P1
@@ -41,6 +45,7 @@
 - 补齐 `requirements.txt`、config 落盘、训练中 mAP 追踪。
 - `np.trapezoid` 兼容（NumPy 2.0 才有的 API，旧版是 `np.trapz`）。
 - YOLO ID 映射统一为单一事实来源（现散落 4 处）。
+- RPN 负样本采样加日志监控（背景窗口 num_pos=0 时全量负 anchor，需观察召回率是否异常再调 pos:neg）。
 
 ### P2
 - stale 注释清理（只标记，不删死代码）。
@@ -49,14 +54,14 @@
 - GC10DET 残余隔离收尾。
 
 ## 下一步
-**P0.4**：背景窗口参与 RPN 分类损失，ROI 正样本跳过（改 `train.py` 的 `n_obj==0` 跳过逻辑）。
+**P0.5**：统一 proposal 提取逻辑（train / validate / inference 三处重复，抽成公共函数）。
 
 ## 关键决策
 全部按 CLAUDE.md 的默认规则执行（见 DECISIONS.md 决策表）。
 
 ## 风险（当前未修复）
-1. **背景窗口被跳过** —— `n_obj==0` 的样本整体 `continue`，背景负样本完全没参与训练。
-2. **proposal 逻辑三处重复** —— 改一处易漏另外两处（train / validate / inference）。
+1. **proposal 逻辑三处重复** —— 改一处易漏另外两处（train / validate / inference）。
+2. **背景窗口负样本未限流** —— num_pos=0 时 `sample_anchors` 返回全量负 anchor，可能淹没正样本；需加日志监控负采样情况。
 
 ## 下次恢复方式
 1. 开新会话。

@@ -680,16 +680,19 @@ def train_one_epoch(model, train_loader, optimizer, rpn_trainer, device, img_siz
         batch_rpn_bbox_loss = 0.0
         batch_roi_cls_loss = 0.0
         batch_roi_bbox_loss = 0.0
-        num_valid_samples = 0  # 追踪实际有目标的样本数（排除n_obj=0的空图）
-        
+        num_valid_samples = 0  # 有效样本数（背景窗口也计入：参与 RPN 负样本损失）
+
         for b in range(batch_size):
             n_obj = num_objects[b].item()
+
             if n_obj == 0:
-                continue
-            
-            gt_boxes_xywh = bbox_labels[b, :n_obj, :4]
-            gt_boxes = xywh_to_xyxy(gt_boxes_xywh, img_size).to(device)
-            gt_class_ids = bbox_labels[b, :n_obj, 4].long().to(device)
+                # [P0.4] 背景窗口：空 GT，参与 RPN 分类损失（负样本），ROI 正样本跳过
+                gt_boxes = torch.zeros((0, 4), device=device)
+                gt_class_ids = torch.zeros((0,), dtype=torch.long, device=device)
+            else:
+                gt_boxes_xywh = bbox_labels[b, :n_obj, :4]
+                gt_boxes = xywh_to_xyxy(gt_boxes_xywh, img_size).to(device)
+                gt_class_ids = bbox_labels[b, :n_obj, 4].long().to(device)
 
             num_valid_samples += 1
             
@@ -778,7 +781,11 @@ def train_one_epoch(model, train_loader, optimizer, rpn_trainer, device, img_siz
                     keep = torch.cat(keep_list)
                     proposals.append(sampled_boxes[keep])
                     proposal_scores.append(sampled_scores[keep])
-            
+
+            if n_obj == 0:
+                # [P0.4] 背景窗口：跳过 ROI Head（无 GT 正样本，只贡献 RPN 负样本）
+                continue
+
             if len(proposals) > 0:
                 proposals = torch.cat(proposals, dim=0)
                 proposal_scores = torch.cat(proposal_scores, dim=0)
@@ -941,7 +948,7 @@ def train_one_epoch(model, train_loader, optimizer, rpn_trainer, device, img_siz
             batch_roi_cls_loss = batch_roi_cls_loss + roi_cls_loss
             batch_roi_bbox_loss = batch_roi_bbox_loss + roi_bbox_loss
         
-        # 用实际有效样本数做平均（排除n_obj=0的空图，避免loss被稀释）
+        # 用有效样本数做平均（背景窗口也计入，因其参与 RPN 负样本损失）
         effective_batch_size = max(num_valid_samples, 1)
         # [Round18] 回退到等权loss（R17的2x bbox权重无益）
         # [R39] 验证loss也用相同权重，保持训练/验证一致
