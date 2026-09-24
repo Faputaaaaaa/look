@@ -6,3 +6,5 @@
 2. **GC10DET 是长期保留（隔离）还是后续彻底删除？** 当前决策是「隔离」，但若要精简代码库，后续可考虑删除 VOC 路径。
 
 3. **背景窗口参与 RPN 损失后，负样本配比是否沿用 pos:neg = 1:3？** 现有 `sample_anchors` 用 1:3，修复后是否需要调整配比以平衡背景窗口带来的负样本。
+
+4. **AP 计算是否锚定 recall=0？** `evaluate_map` 用 `np.trapezoid(precision, recall)`，没锚定 recall=0 起点，会略低估 AP（纯 TP 时 AP=0.75 而非 1.0）。这属「评估协议」变更，是否按 VOC 标准（recall 起点补 0）修正？
