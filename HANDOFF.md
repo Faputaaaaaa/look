@@ -3,18 +3,22 @@
 > 记录当前进度，供下次新会话快速恢复。恢复时先读本文件 + CLAUDE.md + DECISIONS.md。
 
 ## 当前阶段
-审查已完成，**尚未修改任何源代码**。
+**P0.1 已完成**，正在做 P0.2（修 mAP 泄露）。今日（2026-09-24）时间盒：11:45～13:30，只做可中断低风险任务。
 
 ## 已完成
 - 通读 6 个核心文件（config / utils / model_fpn / dataset / train / sahi_inference，共约 4300 行）和 5 个诊断脚本。
 - 核对数据集实际结构：dirty / missing 各 100 张，原图 4096×2736，每图 1 个缺陷。
 - 输出完整审查报告（代码现状 / 缺失模块 / 潜在 bug / 待完善项）。
+- **P0.1** 按原图分层划分 train/val，`seed=42`，落盘 `split.json`（脚本 `make_split.py`）。
+  - 原图 ID 用 `{子集}/{文件名}`（如 `dirty/frame_0000.jpg`），因 dirty/missing 文件名同为 frame_XXXX.jpg 会重名。
+  - 原图 ID 映射存在：切片是运行时生成，窗口样本 `meta['img_path']` 即来源原图，按原图分后无切片级泄露。
+  - 结果：dirty 80/20、missing 80/20，val 各 20 张（≥15，达标）。
 
 ## 未完成（按优先级）
 
 ### P0（必须先做）
-- **P0.1** 按原图 80/20 划分 train/val，`seed=42`，落盘 `split.json`。
-- **P0.2** 修 mAP 评估 train/val 泄露（`sahi_inference.py:evaluate_map`：`max_imgs=50` 取后 25 张，但验证集只有后 20 张；`per_subset` 需对齐到 20）。
+- ~~**P0.1** 按原图 80/20 划分 train/val，`seed=42`，落盘 `split.json`。~~ ✅ 已完成
+- **P0.2** 修 mAP 评估 train/val 泄露（`sahi_inference.py:evaluate_map`：改为只读 `split.json` 的 val 原图）。
 - **P0.3** 修 warmup（`WarmupCosineScheduler` 真正更新两个参数组 lr，而非只改日志）。
 - **P0.4** 背景窗口参与 RPN 分类损失，ROI 正样本跳过（改 `train.py` 的 `n_obj==0` 跳过逻辑）。
 - **P0.5** 统一 proposal 提取逻辑（train / validate / inference 三处重复，抽成公共函数）。
@@ -33,7 +37,7 @@
 - GC10DET 残余隔离收尾。
 
 ## 下一步
-**P0.1**：按原图划分 train/val，80/20，`seed=42`，落盘 `split.json`。
+**P0.2**：修 `sahi_inference.py:evaluate_map`，改为只读 `split.json` 的 val 原图，SAHI 合并后按原图算 mAP@0.5，报告每类 AP/P/R。
 
 ## 关键决策
 全部按 CLAUDE.md 的默认规则执行（见 DECISIONS.md 决策表）。
