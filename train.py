@@ -349,8 +349,8 @@ def get_lr_scheduler(optimizer, stage: int, epochs: int):
 class WarmupCosineScheduler:
     """带预热的余弦退火调度器。
 
-    前 warmup_epochs 轮：线性从 0 增长到 target_lr
-    之后：使用基础调度器（如 CosineAnnealingWarmRestarts）
+    前 warmup_epochs 轮：线性从 ~0 增长到各参数组的 target_lr，并**真正写入 optimizer**。
+    之后：交给 base_scheduler（CosineAnnealingWarmRestarts）。
 
     用法：
         base_scheduler = CosineAnnealingWarmRestarts(optimizer, ...)
@@ -364,25 +364,36 @@ class WarmupCosineScheduler:
         self.base_scheduler = base_scheduler
         self.warmup_epochs = warmup_epochs
         self.current_epoch = 0
-        # 记录初始学习率（预热结束时的目标值）
-        self.target_lr = None
+        # 各参数组预热结束时的目标 lr（阶段1: RPN 5x / 其他 1x；阶段2同理）。
+        # base_scheduler.base_lrs 与 optimizer.param_groups 的初始 lr 一致。
+        if hasattr(self.base_scheduler, 'base_lrs'):
+            self.target_lrs = list(self.base_scheduler.base_lrs)
+        else:
+            self.target_lrs = [g['lr'] for g in self.base_scheduler.optimizer.param_groups]
+        self.last_lrs = [0.0] * len(self.target_lrs)
+        # 预热从 ~0 起步：立即把各参数组 lr 置为极小值，使第 0 个 epoch 即低 lr 开始
+        self._apply_lrs([t * 1e-8 for t in self.target_lrs])
+
+    def _apply_lrs(self, lrs):
+        """把 lrs 写入 optimizer 各参数组，并记录为 last_lrs（真实 lr）。"""
+        self.last_lrs = list(lrs)
+        for group, lr in zip(self.base_scheduler.optimizer.param_groups, lrs):
+            group['lr'] = lr
 
     def step(self):
         if self.current_epoch < self.warmup_epochs:
+            # 线性预热：lr = target * (epoch+1) / warmup_epochs，写回 optimizer
             self.current_epoch += 1
+            progress = self.current_epoch / self.warmup_epochs
+            self._apply_lrs([t * progress for t in self.target_lrs])
         else:
-            self.base_scheduler.step()
             self.current_epoch += 1
+            self.base_scheduler.step()
+            self.last_lrs = list(self.base_scheduler.get_last_lr())
 
     def get_last_lr(self):
-        if self.current_epoch <= self.warmup_epochs:
-            # 线性预热: lr = target_lr * (epoch / warmup_epochs)
-            if self.target_lr is None:
-                self.target_lr = self.base_scheduler.get_last_lr()[0]
-            progress = max(self.current_epoch / self.warmup_epochs, 1e-8)
-            return [self.target_lr * progress]
-        else:
-            return self.base_scheduler.get_last_lr()
+        """返回真实当前 lr（各参数组，已写入 optimizer）。"""
+        return self.last_lrs
 
 
 # ============================================================
