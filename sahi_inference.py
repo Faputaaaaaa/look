@@ -248,6 +248,25 @@ def compute_iou(box1, box2):
     return inter / max(union, 1e-6)
 
 
+def voc_ap(rec, prec):
+    """VOC 标准 AP（all-point interpolation）。
+
+    锚定 recall=0（precision 补 1）、recall=1（precision 补 0），
+    precision 做单调不减插值，再按 recall 分段积分。
+
+    注意：改用此标准实现后，AP/mAP 数字与旧版（np.trapezoid 未锚定 recall=0）
+    不可直接比较，旧版会系统性偏低。
+    """
+    mrec = np.concatenate(([0.0], rec, [1.0]))
+    mpre = np.concatenate(([1.0], prec, [0.0]))
+    # 单调不减插值：从右往左取 max
+    for i in range(mpre.size - 1, 0, -1):
+        mpre[i - 1] = np.maximum(mpre[i - 1], mpre[i])
+    idx = np.where(mrec[1:] != mrec[:-1])[0]
+    ap = np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
+    return float(ap)
+
+
 def load_split():
     """读取 split.json（按原图划分，seed=42）。"""
     with open(SPLIT_PATH, 'r', encoding='utf-8') as f:
@@ -332,16 +351,17 @@ def evaluate_map(model, split='val', max_imgs=None):
         tp, fp, fn = s['tp'], s['fp'], s['fn']
         precision = tp / max(tp + fp, 1)
         recall = tp / max(tp + fn, 1)
-        if s['scores']:
+        n_pos = tp + fn  # 该类 GT 总数
+        if s['scores'] and n_pos > 0:
             scores = np.array(s['scores'])
             tps = np.array(s['tps'])
             order = np.argsort(-scores)
             tps = tps[order]
             cum_tp = np.cumsum(tps)
             cum_fp = np.cumsum(1 - tps)
-            precision_arr = cum_tp / np.maximum(cum_tp + cum_fp, 1)
-            recall_arr = cum_tp / max(tp + fn, 1)
-            ap = np.trapezoid(precision_arr, recall_arr) if len(recall_arr) > 1 else precision
+            rec = cum_tp / n_pos
+            prec = cum_tp / np.maximum(cum_tp + cum_fp, 1)
+            ap = voc_ap(rec, prec)
         else:
             ap = 0.0
         aps.append(ap)
