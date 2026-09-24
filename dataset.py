@@ -475,7 +475,7 @@ class DefectDataset(Dataset):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
         """滑动窗口处理。
 
-        [R40] 启用数据增强（仅bbox-safe操作：水平/垂直翻转 + ColorJitter）。
+        [R40] 启用数据增强（仅bbox-safe操作：水平翻转 + ColorJitter）。
         - 不启用RandomCrop：dirty占切片43%，crop后可能切掉缺陷
         - 不启用马赛克：4图拼接会让dirty占满整图，破坏缺陷尺度分布
         - 翻转和颜色增强不破坏bbox坐标（仅翻转需对称翻转cx/cy）
@@ -504,11 +504,6 @@ class DefectDataset(Dataset):
             if random.random() < 0.5:
                 img_resized = img_resized.transpose(Image.FLIP_LEFT_RIGHT)
                 bboxes = [[1.0 - b[0], b[1], b[2], b[3], b[4]] for b in bboxes]
-
-            # 垂直翻转 p=0.3（瓶身无方向偏置，可启用）
-            if random.random() < 0.3:
-                img_resized = img_resized.transpose(Image.FLIP_TOP_BOTTOM)
-                bboxes = [[b[0], 1.0 - b[1], b[2], b[3], b[4]] for b in bboxes]
 
             # 颜色增强（不影响bbox）
             if self.color_transform:
@@ -630,11 +625,6 @@ class DefectDataset(Dataset):
             if random.random() < 0.5:
                 img_resized = img_resized.transpose(Image.FLIP_LEFT_RIGHT)
                 bboxes = [[self.img_size - b[0], b[1], b[2], b[3], b[4]] for b in bboxes]
-
-            # 4.1.5 [R22] 垂直翻转（打破Y轴对称性偏置）
-            if random.random() < 0.3:
-                img_resized = img_resized.transpose(Image.FLIP_TOP_BOTTOM)
-                bboxes = [[b[0], self.img_size - b[1], b[2], b[3], b[4]] for b in bboxes]
 
             # 4.2 颜色增强
             if self.color_transform:
