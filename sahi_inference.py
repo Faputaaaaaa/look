@@ -10,6 +10,7 @@
 7. 可视化输出
 """
 import os
+import json
 import torch
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -24,6 +25,7 @@ from dataset import DefectDataset
 # ============ 配置 ============
 MODEL_PATH = r"experiments\exp_20260812_093621\models\best_model.pth"  # [R40] R40修复后完整训练（早停39/50）
 DATA_DIR = Path(r"d:\deeplearning\learn\xinpaide")
+SPLIT_PATH = Path(__file__).resolve().parent / "split.json"  # 按原图划分的结果（P0.1）
 SUBSETS = ['dirty', 'missing']
 YOLO_ID_TO_NAME = {3: 'missing', 4: 'dirty'}  # 数据集GT id -> name
 # 模型输出: 0=BG, 1=missing, 2=dirty
@@ -246,34 +248,42 @@ def compute_iou(box1, box2):
     return inter / max(union, 1e-6)
 
 
-def evaluate_map(model, max_imgs=50, split='val'):
-    """评估mAP
+def load_split():
+    """读取 split.json（按原图划分，seed=42）。"""
+    with open(SPLIT_PATH, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
-    [R40] split='val' 取后N张（验证集，未参与训练）；split='train' 取前N张（训练集，仅用于过拟合诊断）。
-    之前固定取前25张导致 93.9% mAP 是训练集自评，不能反映泛化能力。
+
+def resolve_image(img_id):
+    """把 split.json 的原图 ID（如 'dirty/frame_0001.jpg'）解析为 (img_path, lbl_path, subset)。"""
+    subset, fname = img_id.split('/', 1)
+    img_file = DATA_DIR / subset / "images" / fname
+    lbl_file = DATA_DIR / subset / "labels" / f"{Path(fname).stem}.txt"
+    return img_file, lbl_file, subset
+
+
+def evaluate_map(model, split='val', max_imgs=None):
+    """评估 mAP@0.5（SAHI 合并后按原图算）。
+
+    只读 split.json 的 val 原图（禁止用训练图）。流程：
+    1. 每张原图 SAHI 切片推理 → 框映射回原图坐标系 → 全局 NMS 合并。
+    2. 按原图算每类 TP/FP/FN，再算 AP / precision / recall。
+
+    Args:
+        model: 已加载的模型。
+        split: 'val'（默认）或 'train'（仅过拟合诊断，读 split.json 的 train）。
+        max_imgs: 可选，只评估前 N 张（冒烟测试用）；None=全量。
     """
     print(f"\n{'='*60}")
-    print(f"SAHI切片推理 mAP评估  [split={split}]")
+    print(f"SAHI切片推理 mAP评估  [split={split}, 只读 split.json]")
     print(f"{'='*60}")
 
-    test_imgs = []
-    per_subset = max_imgs // len(SUBSETS)
-    for subset in SUBSETS:
-        img_dir = DATA_DIR / subset / "images"
-        lbl_dir = DATA_DIR / subset / "labels"
-        subset_imgs = []
-        for img_file in sorted(img_dir.glob("*.jpg")):
-            lbl_file = lbl_dir / f"{img_file.stem}.txt"
-            subset_imgs.append((img_file, lbl_file, subset))
-        if len(subset_imgs) > per_subset:
-            if split == 'val':
-                # 取后N张（验证集，未参与训练）
-                subset_imgs = subset_imgs[-per_subset:]
-            else:
-                # 取前N张（训练集，用于诊断过拟合）
-                subset_imgs = subset_imgs[:per_subset]
-        test_imgs.extend(subset_imgs)
-    print(f"评估图片数: {len(test_imgs)}  (split={split})")
+    sp = load_split()
+    val_ids = sp[split]
+    if max_imgs is not None:
+        val_ids = val_ids[:max_imgs]
+    test_imgs = [resolve_image(img_id) for img_id in val_ids]
+    print(f"评估原图数: {len(test_imgs)}  (split={split}, 来自 split.json)")
 
     stats = {name: {'tp': 0, 'fp': 0, 'fn': 0, 'scores': [], 'tps': []} for name in MODEL_CLS_TO_NAME.values()}
 
@@ -451,13 +461,14 @@ def visualize_one(model, img_path, out_path, gt_path=None):
 
 if __name__ == "__main__":
     model = load_model()
-    # [R40] 评估用验证集（后20张），不再用训练集前25张自评
-    mAP = evaluate_map(model, max_imgs=50, split='val')
+    # 评估只读 split.json 的 val 原图（禁止训练图）
+    mAP = evaluate_map(model, split='val')
     print("\n生成可视化（验证集）...")
+    sp = load_split()
     for subset in SUBSETS:
-        img_dir = DATA_DIR / subset / "images"
-        # [R40] 取后2张（验证集），不再取前2张（训练集）
-        imgs = sorted(img_dir.glob("*.jpg"))[-2:]
-        for img_file in imgs:
-            out = f"r40_vis_{subset}_{img_file.name}"
+        # 可视化取 val 原图（来自 split.json），避免用训练图
+        val_subset = [x for x in sp['val'] if x.startswith(f"{subset}/")][-2:]
+        for img_id in val_subset:
+            img_file, _, _ = resolve_image(img_id)
+            out = f"r40_vis_{subset}_{Path(img_id).name}"
             visualize_one(model, str(img_file), out)
