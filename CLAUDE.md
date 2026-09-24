@@ -16,11 +16,14 @@
 - 指标用 **mAP@0.5**。
 - 流程：SAHI 切片推理 → 框映射回原图坐标系 → 全局 NMS 合并 → **按原图**计算。
 - 报告**每类**的 AP、precision、recall（不只给 mAP）。
+- AP 计算锚定 recall=0、precision 补 1（标准 VOC/COCO）；改后数字不可与之前直接比。
 
 ## 训练规则
 - **背景窗口保留**：参与 RPN 分类损失（提供负样本）；ROI Head 的**正样本跳过**背景窗口。
-  - 当前 bug：`train.py` 中 `if n_obj == 0: continue` 把背景窗口整个跳过，需修复为「背景窗口参与 RPN cls loss，ROI 正样本跳过」。
-- **Warmup 保留并修好**：当前 `WarmupCosineScheduler` 是空操作（`step()` 在 warmup 期间不更新 optimizer lr）。需真正更新**两个参数组**（RPN 5x / 其他 1x）的 lr。
+  - 待办 P0.4：`train.py` 中 `if n_obj == 0: continue` 把背景窗口整个跳过，需修复为「背景窗口参与 RPN cls loss，ROI 正样本跳过」。
+- **Warmup（已修好）**：warmup 期间线性从 ~0 升到 target，并真正写入两个参数组（RPN 5x / 其他 1x）的 lr。
+- **RPN 负样本配比**：保持 pos:neg = 1:3，加日志监控负样本采样；召回率异常再调。
+- **数据增强**：只保留水平翻转；垂直翻转移除（瓶身有方向性）。
 
 ## 推理后处理
 - **1.3x（missing）/ 1.1x（dirty）检测框扩张保留**，不要删，但要**配置化**（移入 config，不硬编码在 `sahi_inference.py`）。

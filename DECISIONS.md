@@ -13,5 +13,9 @@
 | 后处理扩张 | 1.3x(missing) / 1.1x(dirty) 保留，配置化 |
 | 死代码 | 不删，只标记 |
 | 数据集范围 | GC10DET 残余隔离，默认只跑 missing / dirty |
+| 数据增强 | 只保留水平翻转；垂直翻转移除（瓶身有方向性） |
+| GC10DET | 长期隔离，等 missing/dirty 稳定后再删，现在不删 |
+| RPN 负样本 | 保持 pos:neg=1:3，加日志监控负样本采样；召回率异常再调 |
+| AP 计算 | 锚定 recall=0、precision 补 1（标准 VOC/COCO）；改后数字不可与之前直接比 |
 | 长任务 | tmux / nohup + 日志写文件 |
 | 阶段收尾 | 每阶段更新 HANDOFF.md / STATUS.md 并 git commit |
