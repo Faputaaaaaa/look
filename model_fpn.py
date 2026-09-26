@@ -948,6 +948,8 @@ FPN_CONFIG = {
         'pos_iou_thresh': 0.3,
         'neg_iou_thresh': 0.1,
         'pos_neg_ratio': 3,
+        # [问题2] 背景窗口负样本上限：每背景窗口最多补 64 个负 anchor（正负比 1:3 不变）。
+        'max_neg_per_bg_window': 64,
         'nms_thresh': 0.5,
         'pre_nms_top_n': 200,
         'post_nms_top_n': 300,

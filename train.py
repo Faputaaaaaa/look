@@ -526,6 +526,7 @@ class RPNTrainer:
         self.pos_iou_thresh = cfg['pos_iou_thresh']
         self.neg_iou_thresh = cfg['neg_iou_thresh']
         self.pos_neg_ratio = cfg['pos_neg_ratio']
+        self.max_neg_per_bg_window = cfg.get('max_neg_per_bg_window', 64)  # [问题2] 背景窗口负样本上限
 
         # [R35] RPN分类回退到标准BCEWithLogitsLoss
         # [R28-R34] Focal Loss/加权BCE均未解决spatial bias
@@ -542,11 +543,13 @@ class RPNTrainer:
         只做监控，不改变 pos:neg=1:3 的采样策略。统计口径：
         - pos_anchors: 所有正 anchor 总数（各 FPN 层累计，正样本全保留）。
         - neg_anchors: 采样进入损失的负 anchor 总数。
+        - pos_win_neg_anchors: 来自含缺陷窗口的负 anchor 数。
         - bg_neg_anchors: 来自背景窗口（无 GT）的负 anchor 数。
         """
         self.stats = {
             'pos_anchors': 0,
             'neg_anchors': 0,
+            'pos_win_neg_anchors': 0,
             'bg_neg_anchors': 0,
         }
 
@@ -592,8 +595,16 @@ class RPNTrainer:
         pos_inds = (labels == 1).nonzero(as_tuple=True)[0]
         neg_inds = (labels == 0).nonzero(as_tuple=True)[0]
 
-        num_pos = min(pos_inds.size(0), batch_size // (self.pos_neg_ratio + 1))
-        num_neg = min(neg_inds.size(0), num_pos * self.pos_neg_ratio)
+        if pos_inds.size(0) > 0:
+            # 含缺陷窗口：正样本限量，负样本按 pos:neg=1:3 截取（负样本主要来源）
+            num_pos = min(pos_inds.size(0), batch_size // (self.pos_neg_ratio + 1))
+            num_neg = min(neg_inds.size(0), num_pos * self.pos_neg_ratio)
+        else:
+            # [问题2] 背景窗口：无正样本，负样本限量 max_neg_per_bg_window（默认 64）。
+            # 之前 num_pos=0 -> num_neg=0 -> 最终返回全量负 anchor（~672k/窗口），
+            # 导致背景窗口贡献 99.7% 负 anchor 淹没正样本。现在每背景窗口最多补 64 个。
+            num_pos = 0
+            num_neg = min(neg_inds.size(0), self.max_neg_per_bg_window)
 
         # 正样本: 随机截取(正样本内部难度差异小)
         if pos_inds.size(0) > num_pos and num_pos > 0:
@@ -620,7 +631,7 @@ class RPNTrainer:
         labels, matched_gt, pos_inds = self.assign_targets(anchors, gt_boxes)
         sampled_inds = self.sample_anchors(labels)  # [R12-B基线] 不传cls_pred，使用随机采样
 
-        # [A13] 统计正/负 anchor 采样情况（仅监控，不改 pos:neg=1:3 策略）
+        # [A13] 统计正/负 anchor 采样情况（分别记录含缺陷窗口 / 背景窗口两个负样本来源）
         if hasattr(self, 'stats'):
             n_pos = int((labels == 1).sum().item())
             n_neg_sampled = int((labels[sampled_inds] == 0).sum().item()) if sampled_inds.size(0) > 0 else 0
@@ -628,6 +639,8 @@ class RPNTrainer:
             self.stats['neg_anchors'] += n_neg_sampled
             if gt_boxes.size(0) == 0:
                 self.stats['bg_neg_anchors'] += n_neg_sampled
+            else:
+                self.stats['pos_win_neg_anchors'] += n_neg_sampled
 
         device = anchors.device
         gt_boxes = gt_boxes.to(device)
@@ -1012,11 +1025,10 @@ def train_one_epoch(model, train_loader, optimizer, rpn_trainer, device, img_siz
         total_roi_bbox += (batch_roi_bbox_loss.item() if hasattr(batch_roi_bbox_loss, 'item') else batch_roi_bbox_loss) / effective_batch_size
         num_batches += 1
     
-    # [A13] 每 epoch 打印 RPN anchor 采样统计（背景窗口负样本占比是关键监控指标）
+    # [A13] 每 epoch 打印 RPN anchor 采样统计（两个负样本来源分别打印）
     s = rpn_trainer.stats
-    denom = max(s['neg_anchors'], 1)
-    print(f"[A13] RPN采样: 正anchor={s['pos_anchors']:,}  负anchor={s['neg_anchors']:,}  "
-          f"背景窗口负anchor={s['bg_neg_anchors']:,} ({s['bg_neg_anchors']/denom*100:.1f}%)")
+    print(f"[A13] RPN采样: 正anchor={s['pos_anchors']:,}  负anchor={s['neg_anchors']:,} "
+          f"(含缺陷窗口={s['pos_win_neg_anchors']:,}, 背景窗口={s['bg_neg_anchors']:,})")
 
     return (total_loss / max(num_batches, 1),
             total_rpn_cls / max(num_batches, 1),
