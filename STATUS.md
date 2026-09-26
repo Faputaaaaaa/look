@@ -2,26 +2,24 @@
 
 > 快速一览，细节见 HANDOFF.md。
 
-## 本次会话全部完成（2026-09-26）
-| 项 | 内容 | commit |
-|---|---|---|
-| A13 | 背景窗口负样本日志监控 | 79c6974 |
-| A10 | 窗口内 bbox clip | 93f421d |
-| C1+C2 | requirements.txt + config 落盘 | 00de540 |
-| C3 | checkpoint 续训 + --resume | 7f9b902 |
-| B1/B6/B7/B8 | bbox 回归误差诊断 | febc15f |
-| C5 | 验证结果图生成 | 63e5739 |
-| A7/A9 | _cls_weight 动态 + YOLO ID 统一 | 26a70cf |
-| 问题1+2 | 扩张默认关闭 + 背景窗口限流64 | c73cbe6 |
-| P0.5 | 统一 proposal 提取 | a56d202 |
+## 当前运行中的训练（2026-09-27 01:38 启动，无人值守）
+- 实验: `overnight_20260927`，20 epoch，每 3 epoch 轻量 mAP 验证，重试上限 3。
+- 日志: `exp_logs/train_20260927_013821.log`
+- 进度（最后确认）: epoch 2/20，loss 4.99→3.66 下降中，~268s/epoch ≈ 80 分钟总时长。
+- checkpoint: `experiments/overnight_20260927/models/latest.pth`（每 epoch 更新）+ `best_model.pth`。
+- 完成后自动: `diagnose_bbox.py` → `evaluate_and_visualize.py` → `make_report.py`（生成 `TRAIN_REPORT.md` + `val_metrics.json`）。
 
-## 待办（下次）
-- A11-余：扩张系数重新标定（重训后）。
-- A12 stale 注释、B4/B5 anchor 缓存/死代码标记、C4 GC10DET 隔离（P2）。
-- validate 背景窗口处理与 train 对齐（新发现，见 HANDOFF 风险 3）。
+## 本次会话完成（2026-09-27）
+- validate 对齐背景窗口（与 train 同一规则，loss 可直接比较）。
+- checkpoint 保存/恢复 model + optimizer + scheduler + epoch + RNG。
+- NaN 检测 + OOM 处理（保存 checkpoint 后优雅停止）。
+- 每 epoch 保存 latest.pth；`--total-epochs`、`--val-metrics-every` 参数。
+- `run_all.sh`（自动恢复循环）+ `make_report.py`（报告生成）。
 
-## 下一步
-重新训练 → 重测 bbox 偏差 → 决定扩张系数。
+## 待办（训练完成后 / 下次）
+- 读 TRAIN_REPORT.md + val_metrics.json 评估结果。
+- 重测 bbox 偏差，决定扩张系数是否重新标定（A11-余）。
+- P2 收尾：A12 stale 注释、B4/B5 anchor 缓存/死代码标记、C4 GC10DET 隔离。
 
 ## 阻塞点
-无。QUESTIONS.md 全部已确认。
+无。
