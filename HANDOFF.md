@@ -9,7 +9,7 @@
 - [x] **A13 背景窗口负样本日志监控** —— `RPNTrainer.reset_stats()` + `compute_loss` 统计 + `train_one_epoch` 每 epoch 打印。
   - **关键发现**：背景窗口贡献 **99.7% 的负 anchor**（smoke：24 窗口，正 102,984 vs 负 5,391,384，其中背景窗口负 5,376,000）。背景窗口负样本未限流（每背景窗口全量 ~672k 负 anchor），见「风险」。
 - [x] **A10 窗口内 bbox 裁剪** —— `_get_bboxes_in_window` clip 到 `[0,640]`、clip 后 <4px 丢弃；`sahi_inference` 扩张后 clip 回原图。smoke：144 个窗口 GT 越界 0，其中 85 个贴边（说明 clip 确实在起作用，修前这些 GT 会越界）。
-- [ ] **C1 requirements.txt + C2 config 落盘**
+- [x] **C1 requirements.txt + C2 config 落盘** —— 新增 `requirements.txt`（锁定 torch 2.12.0 / torchvision 0.27.0 / numpy 2.4.2 / Pillow 12.1.1 / matplotlib 3.10.8 / tqdm 4.67.3，注明 CUDA 12.6 索引）；`config.save_config()` 每次实验落盘 `config_<ts>.json`（用 `__dict__` 含 __post_init__ 动态属性）。
 - [ ] **C3 checkpoint 续训**
 - [ ] **B1 根因排查 + B6/B7/B8 诊断**
 - [ ] **C5 验证结果图生成**

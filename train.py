@@ -1433,6 +1433,7 @@ def main():
     config.set_seed()
     exp_dir = config.setup_experiment()
     config.print_config()
+    config.save_config(exp_dir)  # [C2] 落盘配置快照（可复现）
     
     # 打印训练配置
     print("\n" + "=" * 60)

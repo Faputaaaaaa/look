@@ -15,6 +15,7 @@
 """
 
 import os
+import json
 import random
 import numpy as np
 import torch
@@ -245,6 +246,27 @@ class Config:
         
         print(f"[Config] 实验目录: {base_dir}")
         return base_dir
+
+    def save_config(self, base_dir=None) -> Path:
+        """[C2] 保存配置快照到实验目录（文件名带时间戳），保证实验可复现。
+
+        Args:
+            base_dir: 目标目录（Path 或 str），默认 experiments/<experiment_name>。
+
+        Returns:
+            Path: 保存的配置文件路径
+        """
+        base_dir = Path(base_dir) if base_dir else Path("experiments") / self.experiment_name
+        base_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = base_dir / f"config_{ts}.json"
+        # 用 __dict__ 而非 dataclasses.asdict，以包含 __post_init__ 动态属性
+        # （train_img_dirs / val_img_dirs / window_overlap 等）
+        snapshot = dict(self.__dict__)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(snapshot, f, indent=2, ensure_ascii=False, default=str)
+        print(f"[Config] 配置快照已保存: {path}")
+        return path
     
     def print_config(self) -> None:
         """打印当前配置。"""
