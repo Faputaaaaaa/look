@@ -337,26 +337,52 @@ class DefectDataset(Dataset):
         return windows
     
     def _get_bboxes_in_window(self, bboxes: List[Dict], window: Dict) -> List[Dict]:
-        """获取窗口内的边界框。"""
+        """获取窗口内的边界框，并把 GT clip 到窗口边界 [0, window_size]。
+
+        [A10] 修复：之前只判断缺陷中心在窗口内，但记录完整宽高不 clip，
+        导致贴边缺陷的 GT 越界（x1<0 / w>1）。现在：
+        1. 把 GT 在窗口像素坐标下 clip 到 [0, window_w]×[0, window_h]。
+        2. clip 后宽或高 < 4px 的 GT 丢弃（模型输入 640 空间下 4px 已不可学）。
+        """
         img_w = config.original_img_width
         img_h = config.original_img_height
-        
+        win_w = window['w']
+        win_h = window['h']
+        MIN_PX = 4  # clip 后最小尺寸阈值（窗口像素 = 模型输入像素）
+
         window_bboxes = []
-        
+
         for bbox in bboxes:
             cx_px = bbox['cx'] * img_w
             cy_px = bbox['cy'] * img_h
             w_px = bbox['w'] * img_w
             h_px = bbox['h'] * img_h
-            
-            if (window['x'] <= cx_px <= window['x'] + window['w'] and
-                window['y'] <= cy_px <= window['y'] + window['h']):
-                
-                new_cx = (cx_px - window['x']) / window['w']
-                new_cy = (cy_px - window['y']) / window['h']
-                new_w = w_px / window['w']
-                new_h = h_px / window['h']
-                
+
+            if (window['x'] <= cx_px <= window['x'] + win_w and
+                window['y'] <= cy_px <= window['y'] + win_h):
+
+                # 窗口相对像素坐标（未 clip）
+                x1 = cx_px - w_px / 2 - window['x']
+                y1 = cy_px - h_px / 2 - window['y']
+                x2 = cx_px + w_px / 2 - window['x']
+                y2 = cy_px + h_px / 2 - window['y']
+
+                # [A10] clip 到窗口边界
+                x1 = max(0.0, x1)
+                y1 = max(0.0, y1)
+                x2 = min(float(win_w), x2)
+                y2 = min(float(win_h), y2)
+
+                clip_w = x2 - x1
+                clip_h = y2 - y1
+                if clip_w < MIN_PX or clip_h < MIN_PX:
+                    continue  # clip 后太小，丢弃
+
+                new_cx = (x1 + x2) / 2 / win_w
+                new_cy = (y1 + y2) / 2 / win_h
+                new_w = clip_w / win_w
+                new_h = clip_h / win_h
+
                 window_bboxes.append({
                     'class_id': bbox['class_id'],
                     'cx': new_cx,
@@ -365,7 +391,7 @@ class DefectDataset(Dataset):
                     'h': new_h,
                     'original_bbox': bbox
                 })
-        
+
         return window_bboxes
     
     def __len__(self) -> int:
