@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import resnet18
+from torchvision.ops import nms, roi_align
 import numpy as np
 from typing import List, Tuple, Dict, Optional
 from config import config
@@ -703,168 +704,48 @@ class TwoStageDetector(nn.Module):
                 'labels': [B, N] 类别标签
             }
         """
-        from torchvision.ops import nms, roi_align
-        
         B, _, H, W = x.shape
         device = x.device
-        
+
         features = self.extract_features(x)
         fpn_features = self.fpn(features)
         rpn_cls_preds, rpn_bbox_preds = self.rpn(fpn_features, (H, W))
-        
+
         feature_sizes = [(f.size(2), f.size(3)) for f in fpn_features]
         anchors_dict = self.rpn.get_anchors(feature_sizes, device)
-        
+
         all_boxes = []
         all_scores = []
         all_labels = []
-        
+
         for b in range(B):
-            proposals = []
-            proposal_scores = []
-            
-            for i, layer_name in enumerate(['P2', 'P3', 'P4']):
-                anchors = anchors_dict[layer_name]
-
-                # [Round15] RPN输出统一max_anchors(63)通道，需按实际anchor数切片（与train/validate一致）
-                _lc = FPN_CONFIG['anchor_configs'][layer_name]
-                num_anchors_actual = len(_lc['scales']) * len(_lc['ratios'])
-                max_a = self.rpn.max_anchors_per_loc  # = 63
-
-                # [R26修复] permute对齐anchor(与train一致)，之前flatten导致通道主序错位
-                cls_pred = rpn_cls_preds[i][b].permute(1, 2, 0).contiguous()  # [H, W, max_a]
-                cls_pred = cls_pred.reshape(-1, max_a)[:, :num_anchors_actual].reshape(-1)
-                # RPN输出原始logits，推理时需要sigmoid转为概率
-                cls_pred = torch.sigmoid(cls_pred)
-
-                bbox_pred = rpn_bbox_preds[i][b].permute(1, 2, 0).contiguous()
-                bbox_pred = bbox_pred.reshape(-1, max_a, 4)
-                # 只取前 num_anchors_actual 组有效预测（其余为padding）
-                bbox_pred = bbox_pred[:, :num_anchors_actual, :].reshape(-1, 4)
-                
-                boxes = self.decode_boxes(anchors, bbox_pred, img_w=W, img_h=H)
-
-                # [R25] 推理时与训练保持一致：空间感知采样 + 分网格NMS
-                # 解决RPN空间偏置导致proposal分布不均的问题
-                feat_h = fpn_features[i].size(2)
-                feat_w = fpn_features[i].size(3)
-                
-                cls_scores_2d = cls_pred.view(feat_h, feat_w, num_anchors_actual)
-                boxes_2d = boxes.view(feat_h, feat_w, num_anchors_actual, 4)
-                
-                # P3主层用更多anchor，P2/P4用较少的
-                k_per_loc_map = {'P2': 1, 'P3': 3, 'P4': 1}
-                per_cell_max_map = {'P2': 10, 'P3': 30, 'P4': 10}
-                k = k_per_loc_map[layer_name]
-                pcm = per_cell_max_map[layer_name]
-                
-                topk_scores, topk_inds = cls_scores_2d.topk(k, dim=2)
-                topk_inds_expanded = topk_inds.unsqueeze(-1).expand(-1, -1, -1, 4)
-                topk_boxes = boxes_2d.gather(2, topk_inds_expanded)
-                sampled_boxes = topk_boxes.reshape(-1, 4)
-                sampled_scores = topk_scores.reshape(-1)
-                
-                # 分网格独立NMS
-                grid_size = 8
-                cell_w = W / grid_size
-                cell_h = H / grid_size
-                cx = (sampled_boxes[:, 0] + sampled_boxes[:, 2]) / 2
-                cy = (sampled_boxes[:, 1] + sampled_boxes[:, 3]) / 2
-                cell_x = torch.clamp((cx / cell_w).long(), 0, grid_size - 1)
-                cell_y = torch.clamp((cy / cell_h).long(), 0, grid_size - 1)
-                cell_idx = cell_y * grid_size + cell_x
-                
-                keep_list = []
-                for ci in range(grid_size * grid_size):
-                    mask = (cell_idx == ci)
-                    if mask.sum() == 0:
-                        continue
-                    cell_boxes = sampled_boxes[mask]
-                    cell_scores = sampled_scores[mask]
-                    cell_keep = nms(cell_boxes, cell_scores, 0.7)
-                    cell_keep = cell_keep[:pcm]
-                    global_indices = torch.where(mask)[0][cell_keep]
-                    keep_list.append(global_indices)
-                
-                if len(keep_list) > 0:
-                    keep = torch.cat(keep_list)
-                    proposals.append(sampled_boxes[keep])
-                    proposal_scores.append(sampled_scores[keep])
-            
-            if len(proposals) > 0:
-                proposals = torch.cat(proposals, dim=0)
-                proposal_scores = torch.cat(proposal_scores, dim=0)
-                # [R25] 不做全局NMS，与训练保持一致
-                # 每层分网格NMS已去重，总共约3200个proposal
-            else:
-                all_boxes.append(torch.zeros(0, 4, device=device))
-                all_scores.append(torch.zeros(0, device=device))
-                all_labels.append(torch.zeros(0, dtype=torch.long, device=device))
-                continue
-            
+            # [P0.5] 统一 proposal 提取（与 train/validate 共用）
+            proposals, _ = extract_rpn_proposals(
+                self, rpn_cls_preds, rpn_bbox_preds, fpn_features, anchors_dict,
+                img_size=W, batch_idx=b)
             if proposals.size(0) == 0:
                 all_boxes.append(torch.zeros(0, 4, device=device))
                 all_scores.append(torch.zeros(0, device=device))
                 all_labels.append(torch.zeros(0, dtype=torch.long, device=device))
                 continue
-            
-            roi_indices = torch.full((proposals.size(0), 1), b, dtype=torch.float32, device=device)
-            roi_boxes = torch.cat([roi_indices, proposals], dim=1)
-            
-            # 根据proposal大小选择FPN层（修复：之前只使用P3）
-            box_sizes = (proposals[:, 2] - proposals[:, 0]) * (proposals[:, 3] - proposals[:, 1])
-            sqrt_sizes = torch.sqrt(box_sizes)
-            
-            p2_mask = sqrt_sizes < 64
-            p3_mask = (sqrt_sizes >= 64) & (sqrt_sizes < 128)
-            p4_mask = sqrt_sizes >= 128
-            
-            all_roi_features = []
-            all_indices = []
-            all_strides = []
-            
-            if p2_mask.sum() > 0:
-                p2_boxes = roi_boxes[p2_mask]
-                p2_feat = fpn_features[0]
-                p2_roi = roi_align(p2_feat, p2_boxes, output_size=(7, 7), spatial_scale=1.0/4.0)
-                all_roi_features.append(p2_roi)
-                all_indices.append(torch.where(p2_mask)[0])
-                all_strides.append(torch.full((p2_boxes.size(0),), 4, device=device))
-            
-            if p3_mask.sum() > 0:
-                p3_boxes = roi_boxes[p3_mask]
-                p3_feat = fpn_features[1]
-                p3_roi = roi_align(p3_feat, p3_boxes, output_size=(7, 7), spatial_scale=1.0/8.0)
-                all_roi_features.append(p3_roi)
-                all_indices.append(torch.where(p3_mask)[0])
-                all_strides.append(torch.full((p3_boxes.size(0),), 8, device=device))
-            
-            if p4_mask.sum() > 0:
-                p4_boxes = roi_boxes[p4_mask]
-                p4_feat = fpn_features[2]
-                p4_roi = roi_align(p4_feat, p4_boxes, output_size=(7, 7), spatial_scale=1.0/16.0)
-                all_roi_features.append(p4_roi)
-                all_indices.append(torch.where(p4_mask)[0])
-                all_strides.append(torch.full((p4_boxes.size(0),), 16, device=device))
-            
-            if len(all_roi_features) == 0:
+
+            # [P0.5] 按 proposal 尺寸分配 FPN 层 + roi_align
+            roi_features, roi_orig_indices = assign_levels_and_roi_align(
+                proposals, fpn_features, batch_idx=b, device=device)
+            if roi_features is None:
                 all_boxes.append(torch.zeros(0, 4, device=device))
                 all_scores.append(torch.zeros(0, device=device))
                 all_labels.append(torch.zeros(0, dtype=torch.long, device=device))
                 continue
-            
-            roi_features = torch.cat(all_roi_features, dim=0)
-            roi_orig_indices = torch.cat(all_indices, dim=0)
-            
+
             cls_logits, bbox_deltas = self.roi_head(roi_features)
             # [Round19] bbox_deltas现在是共享4维[N,4]，不再per-class
 
             # Softmax多分类
-            cls_probs = torch.softmax(cls_logits, dim=1)  # [N, 6]
-            scores, cls_indices = cls_probs.max(dim=1)   # scores: [N], cls_indices: 0-5
+            cls_probs = torch.softmax(cls_logits, dim=1)  # [N, num_classes+1]
+            scores, cls_indices = cls_probs.max(dim=1)   # scores: [N], cls_indices: 0..num_classes
 
             # [Round19] 直接使用共享4维delta，不需要per-class选择
-            # bbox_deltas: [N, 4] (dx, dy, dw, dh) — 所有类共用
 
             # 应用ROI Head的bbox回归精修（只对非BG的proposal才做精修）
             refined_boxes = self.decode_boxes(
@@ -873,7 +754,7 @@ class TwoStageDetector(nn.Module):
 
             # ============ 多级过滤策略 ============
             # Step 1: 过滤掉背景类（cls_index=0即BG），只保留前景
-            fg_mask = cls_indices > 0  # 前景cls_index: 1-5
+            fg_mask = cls_indices > 0
             if fg_mask.sum() == 0:
                 all_boxes.append(torch.zeros(0, 4, device=device))
                 all_scores.append(torch.zeros(0, device=device))
@@ -882,9 +763,9 @@ class TwoStageDetector(nn.Module):
 
             refined_boxes = refined_boxes[fg_mask]
             scores = scores[fg_mask]
-            labels = cls_indices[fg_mask]  # cls_index 1→label 1(chongkong)等
+            labels = cls_indices[fg_mask]
 
-            # Step 2: 过滤异常框（宽或高为0或负数的框
+            # Step 2: 过滤异常框（宽或高过小的框）
             box_w = refined_boxes[:, 2] - refined_boxes[:, 0]
             box_h = refined_boxes[:, 3] - refined_boxes[:, 1]
             valid_box_mask = (box_w > 2) & (box_h > 2)
@@ -899,10 +780,7 @@ class TwoStageDetector(nn.Module):
 
             # Step 3: score阈值过滤
             # [R35] 降低score_thresh从0.3到0.1
-            # RPN score最高仅0.49，ROI softmax概率可能也偏低
-            # 0.1让足够多候选通过，NMS会过滤重复
             valid_mask = scores > 0.1
-
             final_boxes = refined_boxes[valid_mask]
             final_scores = scores[valid_mask]
             final_labels = labels[valid_mask]
@@ -910,16 +788,138 @@ class TwoStageDetector(nn.Module):
             # Step 4: NMS去重 + 最多max_detections个
             keep = nms(final_boxes, final_scores, INFERENCE_CONFIG['nms_thresh'])
             keep = keep[:INFERENCE_CONFIG['max_detections']]
-            
+
             all_boxes.append(final_boxes[keep])
             all_scores.append(final_scores[keep])
             all_labels.append(final_labels[keep])
-        
+
         return {
             'boxes': all_boxes,
             'scores': all_scores,
             'labels': all_labels
         }
+
+
+# ============================================================
+# [P0.5] 共享的 proposal 提取与 ROI Align 逻辑
+# train / validate / inference 三处原为重复实现，现统一到此。
+# ============================================================
+
+_RPN_LAYERS = ['P2', 'P3', 'P4']
+_RPN_K_PER_LOC = {'P2': 1, 'P3': 3, 'P4': 1}
+_RPN_PER_CELL_MAX = {'P2': 10, 'P3': 30, 'P4': 10}
+_RPN_GRID_SIZE = 8
+_RPN_NMS_THRESH = 0.7
+
+
+def extract_rpn_proposals(model, rpn_cls_preds, rpn_bbox_preds, fpn_features,
+                          anchors_dict, img_size, batch_idx):
+    """从 RPN 输出提取 proposal（空间感知 topk + 分网格 NMS）。
+
+    与 train/validate/inference 三处历史逻辑完全一致（[R25][R26]）。
+
+    Args:
+        model: TwoStageDetector（用其 rpn.max_anchors_per_loc / decode_boxes）。
+        rpn_cls_preds: list[Tensor]，每层 [max_a, H, W]（全 batch）。
+        rpn_bbox_preds: list[Tensor]，每层 [max_a*4, H, W]（全 batch）。
+        fpn_features: list[Tensor]。
+        anchors_dict: dict[layer -> Tensor[N, 4]]。
+        img_size: int（正方形输入，W==H）。
+        batch_idx: int，取该 batch 的 RPN 输出。
+
+    Returns:
+        (proposals [M, 4], scores [M])；无 proposal 时返回空 tensor。
+    """
+    proposals = []
+    proposal_scores = []
+    for i, layer_name in enumerate(_RPN_LAYERS):
+        anchors = anchors_dict[layer_name]
+        _lc = FPN_CONFIG['anchor_configs'][layer_name]
+        num_anchors_actual = len(_lc['scales']) * len(_lc['ratios'])
+        max_a = model.rpn.max_anchors_per_loc
+
+        # [R26] permute 对齐 anchor（位置主序），再按实际 anchor 数切片
+        cls_pred = rpn_cls_preds[i][batch_idx].permute(1, 2, 0).contiguous()  # [H, W, max_a]
+        cls_pred = cls_pred.reshape(-1, max_a)[:, :num_anchors_actual].reshape(-1)
+        cls_scores = torch.sigmoid(cls_pred)
+
+        bbox_pred = rpn_bbox_preds[i][batch_idx].permute(1, 2, 0).contiguous()
+        bbox_pred = bbox_pred.reshape(-1, max_a, 4)[:, :num_anchors_actual, :].reshape(-1, 4)
+
+        boxes = model.decode_boxes(anchors, bbox_pred, img_w=img_size, img_h=img_size)
+
+        feat_h = fpn_features[i].size(2)
+        feat_w = fpn_features[i].size(3)
+        cls_scores_2d = cls_scores.view(feat_h, feat_w, num_anchors_actual)
+        boxes_2d = boxes.view(feat_h, feat_w, num_anchors_actual, 4)
+
+        k = _RPN_K_PER_LOC[layer_name]
+        pcm = _RPN_PER_CELL_MAX[layer_name]
+
+        topk_scores, topk_inds = cls_scores_2d.topk(k, dim=2)
+        topk_boxes = boxes_2d.gather(2, topk_inds.unsqueeze(-1).expand(-1, -1, -1, 4))
+        sampled_boxes = topk_boxes.reshape(-1, 4)
+        sampled_scores = topk_scores.reshape(-1)
+
+        # 分网格独立 NMS
+        cell_w = img_size / _RPN_GRID_SIZE
+        cell_h = img_size / _RPN_GRID_SIZE
+        cx = (sampled_boxes[:, 0] + sampled_boxes[:, 2]) / 2
+        cy = (sampled_boxes[:, 1] + sampled_boxes[:, 3]) / 2
+        cell_idx = (torch.clamp((cy / cell_h).long(), 0, _RPN_GRID_SIZE - 1) * _RPN_GRID_SIZE +
+                    torch.clamp((cx / cell_w).long(), 0, _RPN_GRID_SIZE - 1))
+
+        keep_list = []
+        for ci in range(_RPN_GRID_SIZE * _RPN_GRID_SIZE):
+            mask = (cell_idx == ci)
+            if mask.sum() == 0:
+                continue
+            cell_keep = nms(sampled_boxes[mask], sampled_scores[mask], _RPN_NMS_THRESH)[:pcm]
+            keep_list.append(torch.where(mask)[0][cell_keep])
+
+        if keep_list:
+            keep = torch.cat(keep_list)
+            proposals.append(sampled_boxes[keep])
+            proposal_scores.append(sampled_scores[keep])
+
+    if proposals:
+        return torch.cat(proposals, dim=0), torch.cat(proposal_scores, dim=0)
+    dev = fpn_features[0].device
+    return torch.zeros(0, 4, device=dev), torch.zeros(0, device=dev)
+
+
+def assign_levels_and_roi_align(proposals, fpn_features, batch_idx, device, target_dtype=None):
+    """按 proposal 尺寸分配到 FPN 层，并 roi_align 到 7×7。
+
+    Returns:
+        (roi_features [N, 256, 7, 7], roi_orig_indices [N])；若全空返回 (None, None)。
+    """
+    roi_indices = torch.full((proposals.size(0), 1), batch_idx, dtype=torch.float32, device=device)
+    roi_boxes = torch.cat([roi_indices, proposals], dim=1)
+
+    sqrt_sizes = torch.sqrt((proposals[:, 2] - proposals[:, 0]) * (proposals[:, 3] - proposals[:, 1]))
+    masks = [
+        (sqrt_sizes < 64, fpn_features[0], 1.0 / 4.0),
+        ((sqrt_sizes >= 64) & (sqrt_sizes < 128), fpn_features[1], 1.0 / 8.0),
+        (sqrt_sizes >= 128, fpn_features[2], 1.0 / 16.0),
+    ]
+
+    all_roi_features = []
+    all_indices = []
+    for mask, feat, scale in masks:
+        if mask.sum() > 0:
+            boxes = roi_boxes[mask].to(feat.dtype)
+            r = roi_align(feat, boxes, output_size=(7, 7), spatial_scale=scale)
+            all_roi_features.append(r)
+            all_indices.append(torch.where(mask)[0])
+
+    if not all_roi_features:
+        return None, None
+    roi_features = torch.cat(all_roi_features, dim=0)
+    if target_dtype is not None:
+        roi_features = roi_features.to(target_dtype)
+    roi_orig_indices = torch.cat(all_indices, dim=0)
+    return roi_features, roi_orig_indices
 
 
 # ============================================================
