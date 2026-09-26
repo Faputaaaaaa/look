@@ -13,7 +13,7 @@
 - [x] **C3 checkpoint 续训** —— `save_checkpoint`（model+optimizer+epoch+stage+config）/ `load_checkpoint` + `--resume`/`--exp`；`train_model` 重构为单全局 epoch 循环。smoke：round-trip epoch/权重/momentum/config 全一致。注：resume **不恢复 scheduler 状态**（LR 余弦从新周期开始），属已知限制。
 - [x] **B1 根因排查 + B6/B7/B8 诊断** —— 新增 `diagnose_bbox.py`（原始框回归误差统计），报告到 `experiments/diagnosis/`。**关键发现**：R41 模型 missing 框仅偏小 ~7%（历史 R40 是 50%），dirty 框尺寸正确但有 **+34px 向下中心偏移**（新发现）；1.3x 扩张已过度补偿。roi_align 未传 `aligned`（半像素偏移，非主因）；decode clamp `[-4,3]` 不构成限制。未删 1.3x/1.1x（待确认）。
 - [x] **C5 验证结果图生成** —— 新增 `evaluate_and_visualize.py`（读 split.json val，SAHI 推理，画 GT/预测 + TP/FP/FN 标注，`--n` 控制张数）。smoke：`--n 5` 10 张正常（TP=7 FP=3 FN=3），图存 `experiments/val_vis/`。
-- [ ] **A7/A8/A9 顺手项**
+- [x] **A7/A8/A9 顺手项** —— A7 `_cls_weight` 改动态（`[0.5]+[1.0]*num_classes`）；A8 已随 AP 标准实现自然解决（`voc_ap` 不用 `np.trapezoid`）；A9 YOLO ID 映射统一到 `config.yolo_id_to_name`（dataset/sahi_inference 只 import）。注：`_gen_preprocessed.py`/`_diag_*.py` 旧脚本仍有本地硬编码（诊断脚本，低优先级）。
 
 ## 已完成
 - 通读 6 个核心文件（config / utils / model_fpn / dataset / train / sahi_inference，共约 4300 行）和 5 个诊断脚本。

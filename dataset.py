@@ -266,12 +266,8 @@ class DefectDataset(Dataset):
         """
         bboxes = []
 
-        # [R24] YOLO数字ID → 类名 → 模型class_id 的映射
-        # xinpaide classes.txt: 0=ghosting, 1=faint, 2=fuzziness, 3=missing, 4=dirty, 5=scratch, 6=body_scratch
-        yolo_id_to_name = {
-            0: 'ghosting', 1: 'faint', 2: 'fuzziness',
-            3: 'missing', 4: 'dirty', 5: 'scratch', 6: 'body_scratch'
-        }
+        # [A9] YOLO 数字 ID → 类名 → 模型 class_id 的映射（单一事实来源在 config.yolo_id_to_name）
+        yolo_id_to_name = config.yolo_id_to_name
 
         try:
             with open(label_path, 'r', encoding='utf-8') as f:
