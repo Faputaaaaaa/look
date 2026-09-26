@@ -396,6 +396,22 @@ class WarmupCosineScheduler:
         """返回真实当前 lr（各参数组，已写入 optimizer）。"""
         return self.last_lrs
 
+    def state_dict(self):
+        """[C3] 序列化调度器状态（供 checkpoint 保存）。"""
+        return {
+            'base_scheduler': self.base_scheduler.state_dict(),
+            'current_epoch': self.current_epoch,
+            'warmup_epochs': self.warmup_epochs,
+        }
+
+    def load_state_dict(self, sd):
+        """[C3] 恢复调度器状态（供 --resume）。需在 optimizer.load_state_dict 之后调用。"""
+        self.base_scheduler.load_state_dict(sd['base_scheduler'])
+        self.current_epoch = sd.get('current_epoch', 0)
+        self.warmup_epochs = sd.get('warmup_epochs', self.warmup_epochs)
+        # 从 optimizer 读取真实当前 lr（optimizer.load_state_dict 已恢复 lr）
+        self.last_lrs = [g['lr'] for g in self.base_scheduler.optimizer.param_groups]
+
 
 # ============================================================
 # 早停机制
@@ -438,8 +454,9 @@ class TrainingTracker:
         self.rpn_bbox_losses = []
         self.learning_rates = []
         self.stages = []
-    
-    def add(self, train_loss: float, val_loss: float, 
+        self.val_maps = []  # [C3] (epoch, mAP) 每 N epoch 的轻量验证结果
+
+    def add(self, train_loss: float, val_loss: float,
             rpn_cls_loss: float, rpn_bbox_loss: float,
             lr: float, stage: int):
         self.train_losses.append(train_loss)
@@ -448,6 +465,9 @@ class TrainingTracker:
         self.rpn_bbox_losses.append(rpn_bbox_loss)
         self.learning_rates.append(lr)
         self.stages.append(stage)
+
+    def add_val_map(self, epoch: int, mAP: float):
+        self.val_maps.append((epoch, mAP))
     
     def save_curves(self, save_path: str):
         """保存训练曲线。"""
@@ -950,15 +970,17 @@ def validate(model, val_loader, rpn_trainer, device, img_size):
             for b in range(batch_size):
                 n_obj = num_objects[b].item()
                 if n_obj == 0:
-                    continue
-                
-                gt_boxes_xywh = bbox_labels[b, :n_obj, :4]
-                gt_boxes = xywh_to_xyxy(gt_boxes_xywh, img_size).to(device)
-                gt_class_ids_val = bbox_labels[b, :n_obj, 4].long().to(device)
+                    # [P0.4] 背景窗口：空 GT，参与 RPN 分类损失（负样本），ROI 正样本跳过（与 train 对齐）
+                    gt_boxes = torch.zeros((0, 4), device=device)
+                    gt_class_ids_val = torch.zeros((0,), dtype=torch.long, device=device)
+                else:
+                    gt_boxes_xywh = bbox_labels[b, :n_obj, :4]
+                    gt_boxes = xywh_to_xyxy(gt_boxes_xywh, img_size).to(device)
+                    gt_class_ids_val = bbox_labels[b, :n_obj, 4].long().to(device)
 
                 num_valid_samples += 1
-                
-                # RPN loss：对每层切片计算（validate 只处理 n_obj>0 样本）
+
+                # RPN loss：对每层切片计算（背景窗口也参与，与 train 一致）
                 for i, layer_name in enumerate(['P2', 'P3', 'P4']):
                     anchors = anchors_dict[layer_name]
                     _lc2 = FPN_CONFIG['anchor_configs'][layer_name]
@@ -976,6 +998,10 @@ def validate(model, val_loader, rpn_trainer, device, img_size):
                     )
                     batch_rpn_cls_loss = batch_rpn_cls_loss + cls_loss
                     batch_rpn_bbox_loss = batch_rpn_bbox_loss + bbox_loss
+
+                if n_obj == 0:
+                    # [P0.4] 背景窗口：跳过 ROI Head
+                    continue
 
                 # [P0.5] 统一 proposal 提取 + 按尺寸分配 FPN 层 + roi_align
                 proposals, _ = extract_rpn_proposals(
@@ -1088,21 +1114,44 @@ def validate(model, val_loader, rpn_trainer, device, img_size):
             total_roi_bbox / max(num_batches, 1))
 
 
-def save_checkpoint(path, model, optimizer, epoch, stage, best_loss):
-    """[C3] 保存完整 checkpoint（模型 + 优化器 + epoch + stage + config）。"""
+def _get_rng_state():
+    """[C3] 采集 Python / NumPy / PyTorch 的随机数状态。"""
+    state = {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state['torch_cuda'] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _set_rng_state(state):
+    """[C3] 恢复随机数状态。"""
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.set_rng_state(state['torch'])
+    if 'torch_cuda' in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state['torch_cuda'])
+
+
+def save_checkpoint(path, model, optimizer, scheduler, epoch, stage, best_loss):
+    """[C3] 保存完整 checkpoint（模型 + 优化器 + 调度器 + epoch + RNG + config）。"""
     torch.save({
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
         'epoch': epoch,            # 全局 epoch（0-based，跨两阶段）
         'stage': stage,            # 1 或 2
         'best_loss': best_loss,
+        'rng_state': _get_rng_state(),
         'config': dict(config.__dict__),
         'train_config': dict(TRAIN_CONFIG),
     }, path)
 
 
-def load_checkpoint(path, model, optimizer=None):
-    """[C3] 加载 checkpoint。model 权重直接恢复；optimizer 状态（若提供）也恢复。
+def load_checkpoint(path, model, optimizer=None, scheduler=None):
+    """[C3] 加载 checkpoint，恢复 model / optimizer / scheduler / RNG 全部状态。
 
     Returns:
         dict: checkpoint 内容（含 epoch / stage / best_loss / config）。
@@ -1111,6 +1160,10 @@ def load_checkpoint(path, model, optimizer=None):
     model.load_state_dict(ckpt['model_state_dict'], strict=False)
     if optimizer is not None and 'optimizer_state_dict' in ckpt:
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+    if scheduler is not None and ckpt.get('scheduler_state_dict'):
+        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+    if 'rng_state' in ckpt:
+        _set_rng_state(ckpt['rng_state'])
     return ckpt
 
 
@@ -1133,16 +1186,34 @@ def _build_optimizer_scheduler(model, stage):
     return optimizer, scheduler
 
 
-def train_model(train_loader, val_loader, model, epochs=None, resume_ckpt=None):
-    """训练两阶段检测器（支持 AMP + 学习率预热 + --resume 续训）。
+def run_val_metrics(model, max_imgs=20):
+    """[C3] 轻量 mAP 评估（每 N epoch 调用），失败不阻塞训练。"""
+    try:
+        from sahi_inference import evaluate_map
+        was_training = model.training
+        model.eval()
+        mAP = evaluate_map(model, split='val', max_imgs=max_imgs)
+        if was_training:
+            model.train()
+        return mAP
+    except Exception as e:
+        print(f"[val-metrics] 评估失败（继续训练）: {e}")
+        model.train()
+        return None
+
+
+def train_model(train_loader, val_loader, model, epochs=None, resume_ckpt=None,
+                total_epochs=None, val_metrics_every=0):
+    """训练两阶段检测器（支持 AMP + 预热 + --resume 续训 + 每 N epoch 轻量验证）。
 
     Args:
         resume_ckpt: load_checkpoint 返回的 dict；None 表示从头训练。
+        total_epochs: 覆盖总 epoch 数（None = stage1+stage2）。
+        val_metrics_every: 每 N epoch 跑一次轻量 mAP 验证（0=关）。
     """
     rpn_trainer = RPNTrainer()
     tracker = TrainingTracker()
 
-    # AMP: 创建GradScaler（仅在CUDA + use_amp=True时启用）
     use_amp = config.use_amp and (config.device == 'cuda')
     scaler = GradScaler(enabled=use_amp)
     if use_amp:
@@ -1155,7 +1226,9 @@ def train_model(train_loader, val_loader, model, epochs=None, resume_ckpt=None):
 
     stage1_epochs = TRAIN_CONFIG['stage1_epochs']
     stage2_epochs = TRAIN_CONFIG['stage2_epochs']
-    total_epochs = stage1_epochs + stage2_epochs
+    if total_epochs is None:
+        total_epochs = stage1_epochs + stage2_epochs
+    print(f"[Epochs] 总 epoch 数: {total_epochs} (stage1={stage1_epochs}, stage2={stage2_epochs})")
 
     # [C3] 恢复状态
     start_epoch = 0
@@ -1185,10 +1258,12 @@ def train_model(train_loader, val_loader, model, epochs=None, resume_ckpt=None):
                 print("阶段2: 解冻Layer3，微调整个模型")
                 print("=" * 60)
             optimizer, scheduler = _build_optimizer_scheduler(model, stage)
-            # [C3] resume：仅当 checkpoint 记录的 stage == 当前 stage 时恢复 optimizer
+            # [C3] resume：仅当 checkpoint 记录的 stage == 当前 stage 时恢复 optimizer + scheduler
             if resume_ckpt is not None and resume_ckpt.get('stage') == stage:
                 optimizer.load_state_dict(resume_ckpt['optimizer_state_dict'])
-                print(f"[Resume] 已恢复阶段{stage} optimizer 状态")
+                if resume_ckpt.get('scheduler_state_dict'):
+                    scheduler.load_state_dict(resume_ckpt['scheduler_state_dict'])
+                print(f"[Resume] 已恢复阶段{stage} optimizer + scheduler 状态")
             current_stage = stage
 
         train_loss, rpn_cls, rpn_bbox, roi_cls, roi_bbox = train_one_epoch(
@@ -1206,11 +1281,22 @@ def train_model(train_loader, val_loader, model, epochs=None, resume_ckpt=None):
         tracker.add(train_loss, val_loss, rpn_cls, rpn_bbox, current_lr, stage=stage)
         pbar.set_postfix({'stage': stage, 'loss': f'{val_loss:.4f}', 'lr': f'{current_lr:.6f}'})
 
+        # [C3] 每 epoch 保存 latest checkpoint（供自动恢复）
+        os.makedirs(os.path.dirname(config.model_save_path), exist_ok=True)
+        latest_path = os.path.join(os.path.dirname(config.model_save_path), "latest.pth")
+        save_checkpoint(latest_path, model, optimizer, scheduler, epoch, stage, best_loss)
+
+        # best checkpoint
         if val_loss < best_loss:
             best_loss = val_loss
-            os.makedirs(os.path.dirname(config.model_save_path), exist_ok=True)
-            # [C3] 保存完整 checkpoint（含 optimizer + epoch + stage + config）
-            save_checkpoint(config.model_save_path, model, optimizer, epoch, stage, best_loss)
+            save_checkpoint(config.model_save_path, model, optimizer, scheduler, epoch, stage, best_loss)
+
+        # [C3] 每 N epoch 轻量 mAP 验证
+        if val_metrics_every > 0 and (epoch + 1) % val_metrics_every == 0:
+            mAP = run_val_metrics(model, max_imgs=20)
+            if mAP is not None:
+                tracker.add_val_map(epoch, mAP)
+                print(f"[val-metrics] epoch {epoch+1}: mAP@0.5={mAP:.4f}")
 
         if stage == 2 and early_stopping(val_loss):
             print(f"\n早停！验证损失连续{TRAIN_CONFIG['early_stop_patience']}轮没有改善")
@@ -1225,13 +1311,17 @@ def train_model(train_loader, val_loader, model, epochs=None, resume_ckpt=None):
 # ============================================================
 
 def parse_args():
-    """[C3] 解析命令行参数（--resume / --exp）。"""
+    """[C3] 解析命令行参数（--resume / --exp / --total-epochs / --val-metrics-every）。"""
     import argparse
     parser = argparse.ArgumentParser(description='两阶段缺陷检测训练')
     parser.add_argument('--resume', type=str, default=None,
                         help='从 checkpoint 续训（保存完整状态的 .pth 路径）')
     parser.add_argument('--exp', type=str, default=None,
                         help='实验名称（覆盖默认时间戳）')
+    parser.add_argument('--total-epochs', type=int, default=None,
+                        help='总 epoch 数（覆盖默认 stage1+stage2）')
+    parser.add_argument('--val-metrics-every', type=int, default=0,
+                        help='每 N epoch 跑一次轻量 mAP 验证（0=关）')
     return parser.parse_args()
 
 
@@ -1305,7 +1395,9 @@ def main():
 
     # 训练
     logger.info("开始训练...")
-    model, tracker = train_model(train_loader, val_loader, model, None, resume_ckpt=resume_ckpt)
+    model, tracker = train_model(train_loader, val_loader, model, None, resume_ckpt=resume_ckpt,
+                                 total_epochs=args.total_epochs,
+                                 val_metrics_every=args.val_metrics_every)
     
     # 保存结果
     curve_path = str(exp_dir / "training_curves.png")
