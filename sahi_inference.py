@@ -209,7 +209,14 @@ def sahi_inference(model, img_path):
         elif c == 2:
             w *= EXPAND_DIRTY
             h *= EXPAND_DIRTY
-        expanded.append((cx - w/2, cy - h/2, cx + w/2, cy + h/2, s, c))
+        nx1, ny1 = cx - w/2, cy - h/2
+        nx2, ny2 = cx + w/2, cy + h/2
+        # [A10] 扩张后 clip 回原图边界（贴边缺陷扩张可能越界）
+        nx1 = max(0.0, nx1)
+        ny1 = max(0.0, ny1)
+        nx2 = min(float(iw), nx2)
+        ny2 = min(float(ih), ny2)
+        expanded.append((nx1, ny1, nx2, ny2, s, c))
     return expanded
 
 
