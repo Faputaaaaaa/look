@@ -1293,11 +1293,59 @@ def validate(model, val_loader, rpn_trainer, device, img_size):
             total_roi_bbox / max(num_batches, 1))
 
 
-def train_model(train_loader, val_loader, model, epochs):
-    """训练两阶段检测器（支持AMP混合精度 + 学习率预热）。"""
+def save_checkpoint(path, model, optimizer, epoch, stage, best_loss):
+    """[C3] 保存完整 checkpoint（模型 + 优化器 + epoch + stage + config）。"""
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': epoch,            # 全局 epoch（0-based，跨两阶段）
+        'stage': stage,            # 1 或 2
+        'best_loss': best_loss,
+        'config': dict(config.__dict__),
+        'train_config': dict(TRAIN_CONFIG),
+    }, path)
+
+
+def load_checkpoint(path, model, optimizer=None):
+    """[C3] 加载 checkpoint。model 权重直接恢复；optimizer 状态（若提供）也恢复。
+
+    Returns:
+        dict: checkpoint 内容（含 epoch / stage / best_loss / config）。
+    """
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    model.load_state_dict(ckpt['model_state_dict'], strict=False)
+    if optimizer is not None and 'optimizer_state_dict' in ckpt:
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+    return ckpt
+
+
+def _build_optimizer_scheduler(model, stage):
+    """[C3] 按阶段构建 optimizer + scheduler（并冻结/解冻 backbone）。"""
+    if stage == 1:
+        freeze_backbone(model)
+        lr = TRAIN_CONFIG['stage1_lr']
+    else:
+        unfreeze_backbone(model)
+        lr = TRAIN_CONFIG['stage2_lr']
+    param_groups = build_param_groups(
+        model, lr, rpn_lr_mult=5.0, wd=TRAIN_CONFIG['weight_decay']
+    )
+    optimizer = optim.SGD(
+        param_groups, momentum=TRAIN_CONFIG['momentum'], nesterov=True
+    )
+    base_scheduler = get_lr_scheduler(optimizer, stage=stage, epochs=0)
+    scheduler = WarmupCosineScheduler(base_scheduler, warmup_epochs=config.warmup_epochs)
+    return optimizer, scheduler
+
+
+def train_model(train_loader, val_loader, model, epochs=None, resume_ckpt=None):
+    """训练两阶段检测器（支持 AMP + 学习率预热 + --resume 续训）。
+
+    Args:
+        resume_ckpt: load_checkpoint 返回的 dict；None 表示从头训练。
+    """
     rpn_trainer = RPNTrainer()
     tracker = TrainingTracker()
-    best_loss = float('inf')
 
     # AMP: 创建GradScaler（仅在CUDA + use_amp=True时启用）
     use_amp = config.use_amp and (config.device == 'cuda')
@@ -1310,83 +1358,44 @@ def train_model(train_loader, val_loader, model, epochs):
     warmup_epochs = config.warmup_epochs
     print(f"[Warmup] 预热轮数: {warmup_epochs}")
 
-    # ============================================================
-    # 阶段1: 冻结backbone
-    # ============================================================
-    print("\n" + "=" * 60)
-    print("阶段1: 冻结Layer1/Layer2，训练RPN+FPN+检测头")
-    print("=" * 60)
+    stage1_epochs = TRAIN_CONFIG['stage1_epochs']
+    stage2_epochs = TRAIN_CONFIG['stage2_epochs']
+    total_epochs = stage1_epochs + stage2_epochs
 
-    freeze_backbone(model)
+    # [C3] 恢复状态
+    start_epoch = 0
+    best_loss = float('inf')
+    if resume_ckpt is not None:
+        start_epoch = int(resume_ckpt.get('epoch', 0)) + 1  # 从下一 epoch 继续
+        best_loss = resume_ckpt.get('best_loss', float('inf'))
+        print(f"[Resume] 从全局 epoch {start_epoch} 续训，best_loss={best_loss:.4f}")
 
-    # 阶段1: [R28] 使用参数组，RPN获得5x LR
-    param_groups_1 = build_param_groups(
-        model, TRAIN_CONFIG['stage1_lr'], rpn_lr_mult=5.0, wd=TRAIN_CONFIG['weight_decay']
-    )
-    optimizer = optim.SGD(
-        param_groups_1,
-        momentum=TRAIN_CONFIG['momentum'],
-        nesterov=True
-    )
-    base_scheduler = get_lr_scheduler(optimizer, stage=1, epochs=TRAIN_CONFIG['stage1_epochs'])
-    scheduler = WarmupCosineScheduler(base_scheduler, warmup_epochs=warmup_epochs)
-
-    pbar = tqdm(range(TRAIN_CONFIG['stage1_epochs']), desc='阶段1')
-
-    for epoch in pbar:
-        train_loss, rpn_cls, rpn_bbox, roi_cls, roi_bbox = train_one_epoch(
-            model, train_loader, optimizer, rpn_trainer,
-            config.device, config.img_size, scaler=scaler
-        )
-
-        scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
-
-        val_loss, val_rpn_cls, val_rpn_bbox, val_roi_cls, val_roi_bbox = validate(
-            model, val_loader, rpn_trainer, config.device, config.img_size
-        )
-
-        tracker.add(train_loss, val_loss, rpn_cls, rpn_bbox, current_lr, stage=1)
-
-        pbar.set_postfix({
-            'loss': f'{val_loss:.4f}',
-            'rpn_cls': f'{rpn_cls:.4f}',
-            'rpn_bbox': f'{rpn_bbox:.4f}',
-            'roi_cls': f'{roi_cls:.4f}',
-            'roi_bbox': f'{roi_bbox:.4f}',
-            'lr': f'{current_lr:.6f}'
-        })
-
-        if val_loss < best_loss:
-            best_loss = val_loss
-            os.makedirs(os.path.dirname(config.model_save_path), exist_ok=True)
-            torch.save(model.state_dict(), config.model_save_path)
-
-    # ============================================================
-    # 阶段2: 解冻backbone
-    # ============================================================
-    print("\n" + "=" * 60)
-    print("阶段2: 解冻Layer3，微调整个模型")
-    print("=" * 60)
-
-    unfreeze_backbone(model)
-
-    # 阶段2: [R28] 使用参数组，RPN获得5x LR
-    param_groups_2 = build_param_groups(
-        model, TRAIN_CONFIG['stage2_lr'], rpn_lr_mult=5.0, wd=TRAIN_CONFIG['weight_decay']
-    )
-    optimizer = optim.SGD(
-        param_groups_2,
-        momentum=TRAIN_CONFIG['momentum'],
-        nesterov=True
-    )
-    base_scheduler = get_lr_scheduler(optimizer, stage=2, epochs=TRAIN_CONFIG['stage2_epochs'])
-    scheduler = WarmupCosineScheduler(base_scheduler, warmup_epochs=warmup_epochs)
     early_stopping = EarlyStopping(patience=TRAIN_CONFIG['early_stop_patience'])
+    optimizer = None
+    scheduler = None
+    current_stage = None
 
-    pbar = tqdm(range(TRAIN_CONFIG['stage2_epochs']), desc='阶段2')
-
+    pbar = tqdm(range(start_epoch, total_epochs), desc='训练')
     for epoch in pbar:
+        stage = 1 if epoch < stage1_epochs else 2
+
+        # 进入新阶段时（或 resume 后首次）重建 optimizer + scheduler
+        if stage != current_stage:
+            if stage == 1:
+                print("\n" + "=" * 60)
+                print("阶段1: 冻结Layer1/Layer2，训练RPN+FPN+检测头")
+                print("=" * 60)
+            else:
+                print("\n" + "=" * 60)
+                print("阶段2: 解冻Layer3，微调整个模型")
+                print("=" * 60)
+            optimizer, scheduler = _build_optimizer_scheduler(model, stage)
+            # [C3] resume：仅当 checkpoint 记录的 stage == 当前 stage 时恢复 optimizer
+            if resume_ckpt is not None and resume_ckpt.get('stage') == stage:
+                optimizer.load_state_dict(resume_ckpt['optimizer_state_dict'])
+                print(f"[Resume] 已恢复阶段{stage} optimizer 状态")
+            current_stage = stage
+
         train_loss, rpn_cls, rpn_bbox, roi_cls, roi_bbox = train_one_epoch(
             model, train_loader, optimizer, rpn_trainer,
             config.device, config.img_size, scaler=scaler
@@ -1399,23 +1408,16 @@ def train_model(train_loader, val_loader, model, epochs):
             model, val_loader, rpn_trainer, config.device, config.img_size
         )
 
-        tracker.add(train_loss, val_loss, rpn_cls, rpn_bbox, current_lr, stage=2)
-
-        pbar.set_postfix({
-            'loss': f'{val_loss:.4f}',
-            'rpn_cls': f'{rpn_cls:.4f}',
-            'rpn_bbox': f'{rpn_bbox:.4f}',
-            'roi_cls': f'{roi_cls:.4f}',
-            'roi_bbox': f'{roi_bbox:.4f}',
-            'lr': f'{current_lr:.6f}'
-        })
+        tracker.add(train_loss, val_loss, rpn_cls, rpn_bbox, current_lr, stage=stage)
+        pbar.set_postfix({'stage': stage, 'loss': f'{val_loss:.4f}', 'lr': f'{current_lr:.6f}'})
 
         if val_loss < best_loss:
             best_loss = val_loss
             os.makedirs(os.path.dirname(config.model_save_path), exist_ok=True)
-            torch.save(model.state_dict(), config.model_save_path)
+            # [C3] 保存完整 checkpoint（含 optimizer + epoch + stage + config）
+            save_checkpoint(config.model_save_path, model, optimizer, epoch, stage, best_loss)
 
-        if early_stopping(val_loss):
+        if stage == 2 and early_stopping(val_loss):
             print(f"\n早停！验证损失连续{TRAIN_CONFIG['early_stop_patience']}轮没有改善")
             break
 
@@ -1427,8 +1429,27 @@ def train_model(train_loader, val_loader, model, epochs):
 # 主函数
 # ============================================================
 
+def parse_args():
+    """[C3] 解析命令行参数（--resume / --exp）。"""
+    import argparse
+    parser = argparse.ArgumentParser(description='两阶段缺陷检测训练')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='从 checkpoint 续训（保存完整状态的 .pth 路径）')
+    parser.add_argument('--exp', type=str, default=None,
+                        help='实验名称（覆盖默认时间戳）')
+    return parser.parse_args()
+
+
 def main():
     """主函数。"""
+    args = parse_args()
+    if args.exp:
+        # 覆盖实验名，并重新推导派生路径（__post_init__ 已在 import 时跑过）
+        config.experiment_name = args.exp
+        base_dir = Path("experiments") / config.experiment_name
+        config.model_save_path = str(base_dir / "models" / "best_model.pth")
+        config.log_dir = str(base_dir / "logs")
+
     # 设置随机种子
     config.set_seed()
     exp_dir = config.setup_experiment()
@@ -1477,13 +1498,19 @@ def main():
     
     # 创建模型
     model = TwoStageDetector(num_classes=len(config.class_names)).to(config.device)
-    model.load_pretrained_weights()
-    
+    resume_ckpt = None
+    if args.resume:
+        # [C3] resume：直接从 checkpoint 恢复权重，无需 ImageNet 预训练
+        resume_ckpt = load_checkpoint(args.resume, model)
+        logger.info(f"已从 {args.resume} 恢复模型权重")
+    else:
+        model.load_pretrained_weights()
+
     logger.info(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
-    
+
     # 训练
     logger.info("开始训练...")
-    model, tracker = train_model(train_loader, val_loader, model, None)
+    model, tracker = train_model(train_loader, val_loader, model, None, resume_ckpt=resume_ckpt)
     
     # 保存结果
     curve_path = str(exp_dir / "training_curves.png")
