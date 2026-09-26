@@ -196,20 +196,22 @@ def sahi_inference(model, img_path):
     # [R40] missing类检测框1.3x扩张 + [R41] dirty类1.1x扩张
     # R40: missing框系统性偏小50%，1.3x最佳(mAP 75%→86.9%)
     # R41: dirty类也有轻微偏小，1.1x适度补偿
-    EXPAND_MISSING = 1.3
-    EXPAND_DIRTY = 1.1
+    # [A11] 扩张后处理：系数从 config 读，开关 config.use_bbox_expansion（默认关闭）。
+    # 历史 R40/R41 用 1.3x/1.1x 补偿框偏小，但 B1 诊断发现 R41 已不再偏小 50%，
+    # 扩张过度补偿，故默认关闭；重新训练后按新数据统计再决定是否启用。代码路径保留。
     expanded = []
     for x1, y1, x2, y2, s, c in final:
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
         w = x2 - x1
         h = y2 - y1
-        if c == 1:
-            w *= EXPAND_MISSING
-            h *= EXPAND_MISSING
-        elif c == 2:
-            w *= EXPAND_DIRTY
-            h *= EXPAND_DIRTY
+        if config.use_bbox_expansion:
+            if c == 1:
+                w *= config.expand_missing
+                h *= config.expand_missing
+            elif c == 2:
+                w *= config.expand_dirty
+                h *= config.expand_dirty
         nx1, ny1 = cx - w/2, cy - h/2
         nx2, ny2 = cx + w/2, cy + h/2
         # [A10] 扩张后 clip 回原图边界（贴边缺陷扩张可能越界）

@@ -134,6 +134,13 @@ class Config:
     
     nms_threshold: float = 0.5       # NMS阈值
     score_threshold: float = 0.5     # 置信度阈值
+
+    # [A11] 检测框扩张后处理（默认关闭；重新训练后按新数据统计再决定是否启用）
+    # 历史 R40/R41 用 1.3x(missing)/1.1x(dirty) 补偿框偏小，但 B1 诊断发现
+    # R41 模型 missing 框仅偏小 ~7%（非历史 50%），扩张已过度补偿，故默认关闭。
+    use_bbox_expansion: bool = False  # 是否启用扩张（开关）
+    expand_missing: float = 1.3       # missing 类扩张系数（历史值，保留）
+    expand_dirty: float = 1.1         # dirty 类扩张系数（历史值，保留）
     
     # ============================================================
     # 路径参数

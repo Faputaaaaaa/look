@@ -13,6 +13,8 @@
 - **B1 根因排查 + B6/B7/B8 诊断** —— `diagnose_bbox.py`（原始框回归误差统计），报告到 `experiments/diagnosis/`。关键发现见「风险」。
 - **C5 验证结果图生成** —— `evaluate_and_visualize.py`（TP/FP/FN 标注，`--n` 控制张数）。
 - **A7/A8/A9 顺手项** —— `_cls_weight` 动态化；np.trapezoid 已随 AP 标准实现解决；YOLO ID 映射统一到 `config.yolo_id_to_name`。
+- **问题1（A11）扩张配置化 + 默认关闭** —— `config.use_bbox_expansion=False`（开关）+ `expand_missing`/`expand_dirty`（系数保留，代码路径不删）。重训后按新数据重标定。
+- **问题2 背景窗口负样本限流** —— `max_neg_per_bg_window=64`；负样本主要来自含缺陷窗口，背景窗口每窗口×每层最多补 64。smoke：负 anchor 5.39M → 18,063（背景窗口占比 99.7% → 8.5%）。
 
 ## 未完成（按优先级）
 - **A6 = P0.5** 统一 proposal 提取（train/validate/inference 三处重复）。今天明确不碰。
