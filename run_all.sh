@@ -34,11 +34,12 @@ log "=============================================="
 
 # ===== 训练（带自动恢复） =====
 TRAIN_EXIT=1
-RESUME_ARG=""
+# 支持从指定 checkpoint 续训（RESUME_CKPT 环境变量，可选）
+RESUME_ARG="${RESUME_CKPT:+--resume $RESUME_CKPT}"
 for attempt in $(seq 1 $((MAX_RETRY + 1))); do
     log "----- 训练尝试 $attempt/$((MAX_RETRY + 1)) -----"
     # shellcheck disable=SC2086
-    python train.py --exp "$EXP_NAME" --total-epochs "$TOTAL_EPOCHS" \
+    python -u train.py --exp "$EXP_NAME" --total-epochs "$TOTAL_EPOCHS" \
         --val-metrics-every "$VAL_METRICS_EVERY" $RESUME_ARG >> "$LOG" 2>&1
     TRAIN_EXIT=$?
     if [ $TRAIN_EXIT -eq 0 ]; then
