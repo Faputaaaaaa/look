@@ -532,7 +532,24 @@ class RPNTrainer:
         # [R35] SAHI切片让缺陷清晰可学，先用最简单的BCE建立基线
         # 切片后正样本anchor数量提升(缺陷占比12-27%)，不再需要加权
         self.bbox_loss_fn = CIoULoss()
-    
+
+        # [A13] anchor 采样统计（仅监控，不改采样策略）
+        self.reset_stats()
+
+    def reset_stats(self) -> None:
+        """[A13] 重置每 epoch 的 RPN anchor 采样统计。
+
+        只做监控，不改变 pos:neg=1:3 的采样策略。统计口径：
+        - pos_anchors: 所有正 anchor 总数（各 FPN 层累计，正样本全保留）。
+        - neg_anchors: 采样进入损失的负 anchor 总数。
+        - bg_neg_anchors: 来自背景窗口（无 GT）的负 anchor 数。
+        """
+        self.stats = {
+            'pos_anchors': 0,
+            'neg_anchors': 0,
+            'bg_neg_anchors': 0,
+        }
+
     def assign_targets(self, anchors: torch.Tensor, gt_boxes: torch.Tensor):
         """为锚框分配目标标签。"""
         device = anchors.device
@@ -603,6 +620,15 @@ class RPNTrainer:
         labels, matched_gt, pos_inds = self.assign_targets(anchors, gt_boxes)
         sampled_inds = self.sample_anchors(labels)  # [R12-B基线] 不传cls_pred，使用随机采样
 
+        # [A13] 统计正/负 anchor 采样情况（仅监控，不改 pos:neg=1:3 策略）
+        if hasattr(self, 'stats'):
+            n_pos = int((labels == 1).sum().item())
+            n_neg_sampled = int((labels[sampled_inds] == 0).sum().item()) if sampled_inds.size(0) > 0 else 0
+            self.stats['pos_anchors'] += n_pos
+            self.stats['neg_anchors'] += n_neg_sampled
+            if gt_boxes.size(0) == 0:
+                self.stats['bg_neg_anchors'] += n_neg_sampled
+
         device = anchors.device
         gt_boxes = gt_boxes.to(device)
 
@@ -651,7 +677,8 @@ def train_one_epoch(model, train_loader, optimizer, rpn_trainer, device, img_siz
         scaler: AMP GradScaler，为None时不使用混合精度
     """
     model.train()
-    
+    rpn_trainer.reset_stats()  # [A13] 每 epoch 重置采样统计
+
     total_loss = 0.0
     total_rpn_cls = 0.0
     total_rpn_bbox = 0.0
@@ -984,6 +1011,12 @@ def train_one_epoch(model, train_loader, optimizer, rpn_trainer, device, img_siz
         total_roi_bbox += (batch_roi_bbox_loss.item() if hasattr(batch_roi_bbox_loss, 'item') else batch_roi_bbox_loss) / effective_batch_size
         num_batches += 1
     
+    # [A13] 每 epoch 打印 RPN anchor 采样统计（背景窗口负样本占比是关键监控指标）
+    s = rpn_trainer.stats
+    denom = max(s['neg_anchors'], 1)
+    print(f"[A13] RPN采样: 正anchor={s['pos_anchors']:,}  负anchor={s['neg_anchors']:,}  "
+          f"背景窗口负anchor={s['bg_neg_anchors']:,} ({s['bg_neg_anchors']/denom*100:.1f}%)")
+
     return (total_loss / max(num_batches, 1),
             total_rpn_cls / max(num_batches, 1),
             total_rpn_bbox / max(num_batches, 1),
