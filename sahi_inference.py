@@ -48,10 +48,14 @@ NORMALIZE = transforms.Normalize(
 )
 
 
-def load_model():
-    """加载训练好的模型"""
+def load_model(model_path=None):
+    """加载训练好的模型。
+
+    model_path 未给时，依次用环境变量 SAHI_MODEL_PATH、MODEL_PATH。
+    """
+    path = model_path or os.environ.get('SAHI_MODEL_PATH') or MODEL_PATH
     model = TwoStageDetector(num_classes=len(config.class_names))
-    ckpt = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
+    ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
     state_dict = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
     # [R40] strict=False：旧权重可能没有 residual_proj（新加的残差投影层）
     # 该层零初始化时 residual=0，输出与旧模型完全一致，可安全加载。
@@ -67,7 +71,7 @@ def load_model():
         print(f"[警告] 意外key: {unexpected}")
     model.to(DEVICE)
     model.eval()
-    print(f"模型加载: {MODEL_PATH}")
+    print(f"模型加载: {path}")
     return model
 
 

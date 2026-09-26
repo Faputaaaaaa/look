@@ -59,6 +59,11 @@ TRAIN_CONFIG = {
 }
 
 
+class TrainingDiverged(Exception):
+    """[C3] 训练发散（NaN/Inf loss），用于触发保存 checkpoint 后优雅停止。"""
+    pass
+
+
 # ============================================================
 # 工具函数
 # ============================================================
@@ -901,6 +906,10 @@ def train_one_epoch(model, train_loader, optimizer, rpn_trainer, device, img_siz
             # 全空批次：跳过本次优化步骤
             continue
 
+        # [C3] NaN/Inf 检测：loss 发散则抛出，train_model 捕获后保存 checkpoint 停止
+        if torch.isnan(batch_loss) or torch.isinf(batch_loss):
+            raise TrainingDiverged(f"batch_loss={batch_loss.item():.4f}")
+
         optimizer.zero_grad()
         if scaler is not None:
             # AMP: 缩放loss防止FP16下溢，自动处理混合精度反向传播
@@ -1266,40 +1275,58 @@ def train_model(train_loader, val_loader, model, epochs=None, resume_ckpt=None,
                 print(f"[Resume] 已恢复阶段{stage} optimizer + scheduler 状态")
             current_stage = stage
 
-        train_loss, rpn_cls, rpn_bbox, roi_cls, roi_bbox = train_one_epoch(
-            model, train_loader, optimizer, rpn_trainer,
-            config.device, config.img_size, scaler=scaler
-        )
+        try:
+            train_loss, rpn_cls, rpn_bbox, roi_cls, roi_bbox = train_one_epoch(
+                model, train_loader, optimizer, rpn_trainer,
+                config.device, config.img_size, scaler=scaler
+            )
 
-        scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
+            scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
 
-        val_loss, val_rpn_cls, val_rpn_bbox, val_roi_cls, val_roi_bbox = validate(
-            model, val_loader, rpn_trainer, config.device, config.img_size
-        )
+            val_loss, val_rpn_cls, val_rpn_bbox, val_roi_cls, val_roi_bbox = validate(
+                model, val_loader, rpn_trainer, config.device, config.img_size
+            )
 
-        tracker.add(train_loss, val_loss, rpn_cls, rpn_bbox, current_lr, stage=stage)
-        pbar.set_postfix({'stage': stage, 'loss': f'{val_loss:.4f}', 'lr': f'{current_lr:.6f}'})
+            tracker.add(train_loss, val_loss, rpn_cls, rpn_bbox, current_lr, stage=stage)
+            pbar.set_postfix({'stage': stage, 'loss': f'{val_loss:.4f}', 'lr': f'{current_lr:.6f}'})
 
-        # [C3] 每 epoch 保存 latest checkpoint（供自动恢复）
-        os.makedirs(os.path.dirname(config.model_save_path), exist_ok=True)
-        latest_path = os.path.join(os.path.dirname(config.model_save_path), "latest.pth")
-        save_checkpoint(latest_path, model, optimizer, scheduler, epoch, stage, best_loss)
+            # [C3] 每 epoch 保存 latest checkpoint（供自动恢复）
+            os.makedirs(os.path.dirname(config.model_save_path), exist_ok=True)
+            latest_path = os.path.join(os.path.dirname(config.model_save_path), "latest.pth")
+            save_checkpoint(latest_path, model, optimizer, scheduler, epoch, stage, best_loss)
 
-        # best checkpoint
-        if val_loss < best_loss:
-            best_loss = val_loss
-            save_checkpoint(config.model_save_path, model, optimizer, scheduler, epoch, stage, best_loss)
+            # best checkpoint
+            if val_loss < best_loss:
+                best_loss = val_loss
+                save_checkpoint(config.model_save_path, model, optimizer, scheduler, epoch, stage, best_loss)
 
-        # [C3] 每 N epoch 轻量 mAP 验证
-        if val_metrics_every > 0 and (epoch + 1) % val_metrics_every == 0:
-            mAP = run_val_metrics(model, max_imgs=20)
-            if mAP is not None:
-                tracker.add_val_map(epoch, mAP)
-                print(f"[val-metrics] epoch {epoch+1}: mAP@0.5={mAP:.4f}")
+            # [C3] 每 N epoch 轻量 mAP 验证
+            if val_metrics_every > 0 and (epoch + 1) % val_metrics_every == 0:
+                mAP = run_val_metrics(model, max_imgs=20)
+                if mAP is not None:
+                    tracker.add_val_map(epoch, mAP)
+                    print(f"[val-metrics] epoch {epoch+1}: mAP@0.5={mAP:.4f}")
 
-        if stage == 2 and early_stopping(val_loss):
-            print(f"\n早停！验证损失连续{TRAIN_CONFIG['early_stop_patience']}轮没有改善")
+            if stage == 2 and early_stopping(val_loss):
+                print(f"\n早停！验证损失连续{TRAIN_CONFIG['early_stop_patience']}轮没有改善")
+                break
+
+        except TrainingDiverged as e:
+            # [C3] NaN/Inf：保存当前 checkpoint 后停止训练（run_all.sh 继续诊断）
+            print(f"\n[STOP] 训练发散: {e}，保存 checkpoint 后停止")
+            os.makedirs(os.path.dirname(config.model_save_path), exist_ok=True)
+            latest_path = os.path.join(os.path.dirname(config.model_save_path), "latest.pth")
+            save_checkpoint(latest_path, model, optimizer, scheduler, epoch, stage, best_loss)
+            break
+
+        except torch.cuda.OutOfMemoryError:
+            # [C3] OOM：batch_size=1 无法再降，保存 checkpoint 后停止
+            print(f"\n[STOP] CUDA OOM（batch_size=1 无法再降），保存 checkpoint 后停止")
+            torch.cuda.empty_cache()
+            os.makedirs(os.path.dirname(config.model_save_path), exist_ok=True)
+            latest_path = os.path.join(os.path.dirname(config.model_save_path), "latest.pth")
+            save_checkpoint(latest_path, model, optimizer, scheduler, epoch, stage, best_loss)
             break
 
     logger.info(f"最佳验证损失: {best_loss:.4f}")
