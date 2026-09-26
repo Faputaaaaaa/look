@@ -956,7 +956,8 @@ def train_one_epoch(model, train_loader, optimizer, rpn_trainer, device, img_siz
             # [R24] xinpaide数据集2类权重（missing, dirty各100张，balanced）
             # 权重: BG=0.5, missing=1.0, dirty=1.0
             if not hasattr(model, '_cls_weight'):
-                cls_w = torch.tensor([0.5, 1.0, 1.0], device=device)
+                # [A7] 动态生成类别权重：BG=0.5，各前景类=1.0（长度 = num_classes+1）
+                cls_w = torch.tensor([0.5] + [1.0] * len(config.class_names), device=device)
                 model._cls_weight = cls_w
             roi_cls_loss = F.cross_entropy(sampled_cls_logits, sampled_gt_labels,
                                            weight=model._cls_weight)

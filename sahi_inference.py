@@ -27,7 +27,8 @@ MODEL_PATH = r"experiments\exp_20260812_093621\models\best_model.pth"  # [R40] R
 DATA_DIR = Path(r"d:\deeplearning\learn\xinpaide")
 SPLIT_PATH = Path(__file__).resolve().parent / "split.json"  # 按原图划分的结果（P0.1）
 SUBSETS = ['dirty', 'missing']
-YOLO_ID_TO_NAME = {3: 'missing', 4: 'dirty'}  # 数据集GT id -> name
+# [A9] 从 config 派生目标类 GT id → name 映射（单一事实来源）
+YOLO_ID_TO_NAME = {yid: name for yid, name in config.yolo_id_to_name.items() if name in config.class_names}
 # 模型输出: 0=BG, 1=missing, 2=dirty
 MODEL_CLS_TO_NAME = {1: 'missing', 2: 'dirty'}
 

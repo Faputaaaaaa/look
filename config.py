@@ -100,7 +100,14 @@ class Config:
         'missing': 0,   # YOLO原始ID 3 → 类名 'missing' → 模型class_id 0
         'dirty': 1,     # YOLO原始ID 4 → 类名 'dirty'  → 模型class_id 1
     })
-    
+
+    # [A9] YOLO 原始数字 ID → 类名（xinpaide classes.txt 全 7 类），单一事实来源。
+    # 其余模块（dataset.py / sahi_inference.py）从这里 import，不再各自硬编码。
+    yolo_id_to_name: Dict = field(default_factory=lambda: {
+        0: 'ghosting', 1: 'faint', 2: 'fuzziness',
+        3: 'missing', 4: 'dirty', 5: 'scratch', 6: 'body_scratch'
+    })
+
     # 最大目标数量
     max_objects: int = 10  # xinpaide每张图只有1个缺陷，10足够
     
