@@ -3,6 +3,9 @@
 > 快速一览，细节见 HANDOFF.md。
 
 ## 最新状态（2026-09-29）
+- **GitHub 同步（2026-10-18）**：代码已推送至 `https://github.com/ACAMLab/Defect-Supervised`（main @ eb454b6，含 26 个提交）。
+  - 已上传：核心代码、`defect_platform/`、诊断脚本、`requirements.txt`、文档。
+  - 未上传：数据集、`experiments/`、`exp_logs/`、平台 `outputs/`、`.workbuddy/`。
 - 训练 `overnight_20260927`（20 epoch）已完成，**mAP@0.5 = 0.7788**。
   - missing AP=0.917 (P/R=0.95)；dirty AP=0.640 (P/R=0.80)。
   - 报告: `experiments/overnight_20260927/TRAIN_REPORT.md` + `val_metrics.json`。
