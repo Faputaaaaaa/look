@@ -20,6 +20,16 @@ experiments/
 *.txt
 *.log
 
+# --- 例外：这些虽命中上面的通配符，但必须进版本控制 ---
+!requirements.txt
+!defect_platform/**/*.txt
+
+# --- 本地工具记忆（非项目代码，含个人笔记，不上传） ---
+.workbuddy/
+
+# --- 平台运行产物（效果图/汇总，可随时重生成） ---
+defect_platform/outputs/
+
 # --- 测试/诊断/分析/验证脚本（非核心） ---
 analysis_v3.py
 analyze_anchors.py
@@ -88,3 +98,7 @@ logger.py
 *~
 .DS_Store
 Thumbs.db
+
+# --- 最终例外（必须放在所有忽略规则之后：gitignore 后匹配者优先） ---
+# 上面的 "smoke_test.py" 是根目录诊断脚本规则，会误伤平台冒烟测试
+!defect_platform/smoke_test.py

@@ -1,0 +1,25 @@
+# 瓶身缺陷检测项目依赖（锁定当前可运行环境，2026-09-26，Python 3.14）
+#
+# 安装注意：torch / torchvision 需要 CUDA 12.6 构建，不能用默认 PyPI 源
+# （默认会装成 CPU 版或版本不匹配）。用 PyTorch 官方 CUDA 索引安装：
+#   pip install torch==2.12.0 torchvision==0.27.0 \
+#       --index-url https://download.pytorch.org/whl/cu126
+# 其余依赖用默认 PyPI 即可：
+#   pip install -r requirements.txt
+
+# ---- 深度学习（CUDA 12.6 构建） ----
+torch==2.12.0
+torchvision==0.27.0
+
+# ---- 数值 / 图像 ----
+numpy==2.4.2
+Pillow==12.1.1
+
+# ---- 桌面界面 defect_platform（2026-09-29 新增）----
+# PyQt5 只支持到 Python 3.14 以下较为稳妥；本机实测 Python 3.14 + PyQt5 5.15.11 可用。
+PyQt5==5.15.11
+opencv-python==4.11.0.86
+
+# ---- 训练可视化 / 进度条 ----
+matplotlib==3.10.8
+tqdm==4.67.3

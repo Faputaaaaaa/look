@@ -23,7 +23,18 @@ from model_fpn import TwoStageDetector, FPN_CONFIG, INFERENCE_CONFIG
 from dataset import DefectDataset
 
 # ============ 配置 ============
-MODEL_PATH = r"experiments\exp_20260812_093621\models\best_model.pth"  # [R40] R40修复后完整训练（早停39/50）
+# [R40] 历史默认（保留备注，勿删）：experiments\exp_20260812_093621\models\best_model.pth
+# [平台 2026-09-29] 默认 checkpoint 改为从 config.default_ckpt 派生，并转成**绝对路径**。
+# 原因：旧默认是相对路径常量，`python make_report.py` 单独跑时会静默加载旧实验权重，
+#       报告里的 mAP 与 STATUS.md（overnight_20260927, 0.7788）口径不一致。
+# 优先级：load_model 显式入参 > 环境变量 SAHI_MODEL_PATH > 这里的默认值。
+def _init_model_path():
+    rel = getattr(config, 'default_ckpt', '') or r"experiments\exp_20260812_093621\models\best_model.pth"
+    p = Path(rel)
+    return str(p if p.is_absolute() else Path(__file__).resolve().parent / p)
+
+
+MODEL_PATH = _init_model_path()
 DATA_DIR = Path(r"d:\deeplearning\learn\xinpaide")
 SPLIT_PATH = Path(__file__).resolve().parent / "split.json"  # 按原图划分的结果（P0.1）
 SUBSETS = ['dirty', 'missing']
@@ -91,10 +102,14 @@ def preprocess_crop(crop_img_pil):
 
 
 @torch.no_grad()
-def infer_single_crop(model, crop_tensor):
+def infer_single_crop(model, crop_tensor, score_thresh=None):
     """单切片推理，返回切片内预测框列表
+
+    Args:
+        score_thresh: 可选，覆盖全局 SCORE_THRESH（平台 UI 调阈值时用）
     Returns: list of (x1,y1,x2,y2,score,cls_id) 切片内坐标
     """
+    thr = float(SCORE_THRESH if score_thresh is None else score_thresh)
     out = model.inference(crop_tensor)
     boxes_list = out.get('boxes', [])
     scores_list = out.get('scores', [])
@@ -117,7 +132,7 @@ def infer_single_crop(model, crop_tensor):
     if isinstance(b_boxes, torch.Tensor) and b_boxes.numel() > 0:
         for i in range(b_boxes.size(0)):
             s = float(b_scores[i].item()) if isinstance(b_scores, torch.Tensor) else float(b_scores)
-            if s < SCORE_THRESH:
+            if s < thr:
                 continue
             c = int(b_labels[i].item()) if isinstance(b_labels, torch.Tensor) else int(b_labels)
             if c == 0:
@@ -127,15 +142,25 @@ def infer_single_crop(model, crop_tensor):
     return results
 
 
-def sahi_inference(model, img_path):
-    """对一张原图执行完整SAHI推理
+def sahi_inference_image(model, img, score_thresh=None, max_dets=None, progress=None):
+    """[平台 2026-09-29] 对内存中的 PIL Image 执行完整 SAHI 推理。
+
+    与 sahi_inference() 共用同一条代码路径（评估 / 平台同口径），
+    只把输入从「文件路径」换成「内存图像」，省掉平台侧写临时 jpg 的
+    一次磁盘 IO 与 quality=95 的压缩损失。
+
+    Args:
+        score_thresh: 可选，覆盖全局 SCORE_THRESH
+        max_dets:     可选，覆盖 config.max_dets_per_image（top-k 保留）
+        progress:     可选回调 progress(done, total)，每 8 个切片回调一次
     Returns: list of (x1,y1,x2,y2,score,cls_id) 原图坐标系
     """
-    img = Image.open(img_path).convert('RGB')
     iw, ih = img.size
+    thr = float(SCORE_THRESH if score_thresh is None else score_thresh)
+    keep_k = max(1, int(config.max_dets_per_image if max_dets is None else max_dets))
 
-    all_dets = []
-
+    # [平台 2026-09-29] 先枚举窗口，便于回调切片级进度（UI 进度条）。
+    windows = []
     for y in range(0, ih, STRIDE):
         for x in range(0, iw, STRIDE):
             x2 = min(x + WINDOW, iw)
@@ -144,30 +169,37 @@ def sahi_inference(model, img_path):
             y1 = max(0, y2 - WINDOW)
             if x2 - x1 < 64 or y2 - y1 < 64:
                 continue
+            windows.append((x1, y1, x2, y2))
 
-            crop = img.crop((x1, y1, x2, y2))
-            if crop.size != (IMG_SIZE, IMG_SIZE):
-                padded = Image.new('RGB', (IMG_SIZE, IMG_SIZE), (128, 128, 128))
-                padded.paste(crop, (0, 0))
-                crop = padded
+    all_dets = []
+    total = max(1, len(windows))
+    for _n, (x1, y1, x2, y2) in enumerate(windows, 1):
+        if progress is not None and (_n % 8 == 0 or _n == total):
+            progress(_n, total)
 
-            crop_tensor = preprocess_crop(crop)
-            crop_dets = infer_single_crop(model, crop_tensor)
+        crop = img.crop((x1, y1, x2, y2))
+        if crop.size != (IMG_SIZE, IMG_SIZE):
+            padded = Image.new('RGB', (IMG_SIZE, IMG_SIZE), (128, 128, 128))
+            padded.paste(crop, (0, 0))
+            crop = padded
 
-            for dx1, dy1, dx2, dy2, s, c in crop_dets:
-                edges_touched = 0
-                if dx1 < 5: edges_touched += 1
-                if dy1 < 5: edges_touched += 1
-                if dx2 > IMG_SIZE - 5: edges_touched += 1
-                if dy2 > IMG_SIZE - 5: edges_touched += 1
-                if edges_touched >= 3:
-                    continue
+        crop_tensor = preprocess_crop(crop)
+        crop_dets = infer_single_crop(model, crop_tensor, thr)
 
-                ox1 = dx1 + x1
-                oy1 = dy1 + y1
-                ox2 = dx2 + x1
-                oy2 = dy2 + y1
-                all_dets.append((ox1, oy1, ox2, oy2, s, c))
+        for dx1, dy1, dx2, dy2, s, c in crop_dets:
+            edges_touched = 0
+            if dx1 < 5: edges_touched += 1
+            if dy1 < 5: edges_touched += 1
+            if dx2 > IMG_SIZE - 5: edges_touched += 1
+            if dy2 > IMG_SIZE - 5: edges_touched += 1
+            if edges_touched >= 3:
+                continue
+
+            ox1 = dx1 + x1
+            oy1 = dy1 + y1
+            ox2 = dx2 + x1
+            oy2 = dy2 + y1
+            all_dets.append((ox1, oy1, ox2, oy2, s, c))
 
     if not all_dets:
         return []
@@ -193,9 +225,23 @@ def sahi_inference(model, img_path):
         if len(final) >= MAX_DET * 2:
             break
 
-    # [R38] top-1：每张原图只有1个缺陷
+    # [R38] top-k：数据集每张原图只有 1 个缺陷 → 默认 max_dets_per_image=1（= 评估口径）。
+    # [平台] 产线可能一图多缺陷，keep_k 可由 config.max_dets_per_image / 平台 UI 调大。
     final.sort(key=lambda x: -x[4])
-    final = final[:1]
+    final = final[:keep_k]
+
+    # [A14] dirty 类 dy 偏移补偿：预测框整体 y 平移（默认关闭）。
+    # overnight_20260927 后 dirty 框系统性向下偏移（train/val 均 100% 为正），
+    # 宽高正常，纯平移偏差，故整体上移 dy_comp_dirty 像素。
+    # 越界 clip 由下方扩张段的边界裁剪统一处理。
+    if config.use_dy_compensation and config.dy_comp_dirty != 0.0:
+        shifted = []
+        for x1, y1, x2, y2, s, c in final:
+            if c == 2:  # dirty
+                y1 += config.dy_comp_dirty
+                y2 += config.dy_comp_dirty
+            shifted.append((x1, y1, x2, y2, s, c))
+        final = shifted
 
     # [R40] missing类检测框1.3x扩张 + [R41] dirty类1.1x扩张
     # R40: missing框系统性偏小50%，1.3x最佳(mAP 75%→86.9%)
@@ -225,6 +271,14 @@ def sahi_inference(model, img_path):
         ny2 = min(float(ih), ny2)
         expanded.append((nx1, ny1, nx2, ny2, s, c))
     return expanded
+
+
+def sahi_inference(model, img_path, progress=None):
+    """对一张原图（文件路径）执行完整SAHI推理
+    Returns: list of (x1,y1,x2,y2,score,cls_id) 原图坐标系
+    """
+    img = Image.open(img_path).convert('RGB')
+    return sahi_inference_image(model, img, progress=progress)
 
 
 def load_gt(img_path, label_path):
