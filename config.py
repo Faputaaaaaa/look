@@ -141,6 +141,26 @@ class Config:
     use_bbox_expansion: bool = False  # 是否启用扩张（开关）
     expand_missing: float = 1.3       # missing 类扩张系数（历史值，保留）
     expand_dirty: float = 1.1         # dirty 类扩张系数（历史值，保留）
+
+    # [A14] dirty 类 dy 偏移补偿（后处理整体 y 平移，默认关闭）
+    # overnight_20260927 训练后 dirty 框系统性向下偏移：val dy median=+20.8px、
+    # train dy median=+13.6px（100% 为正），宽高比已正常（~0.98），属平移偏差。
+    # 标定协议：val dirty 前 10 张定参、后 10 张验证（不偷看验证答案）。
+    # [标定结论 2026-09-29] 标定值 -26.3px；后 10 张验证：TP/FP/FN 无变化
+    # （补偿前 P=R=0.900 IoU=0.646 → 补偿后 P=R=0.900 IoU=0.665）。
+    # 原因：偏移量两极分化（一半图 +0~5px、一半 +25~50px，std=18.5），
+    # 固定平移对大偏移图有益、对小偏移图过度纠正，净收益≈0。故保持默认关闭。
+    use_dy_compensation: bool = False  # 是否启用 dy 补偿（开关）
+    dy_comp_dirty: float = -26.3       # dirty 类 y 平移像素（负=上移；标定值，未启用）
+
+    # [平台 2026-09-29] 每张原图最终保留的检测框数（SAHI 全局 NMS 后按分数取 top-k）。
+    # 默认 1 = 评估口径（xinpaide 每张原图只有 1 个缺陷，make_report/mAP 同口径）。
+    # 真实产线可能一图多缺陷，平台 UI 可调到 3/5，不影响评估脚本默认值。
+    max_dets_per_image: int = 1
+
+    # [平台 2026-09-29] 平台默认 checkpoint（相对项目根），供 defect_platform 使用。
+    # 优先级：命令行 --model > 环境变量 SAHI_MODEL_PATH > 本配置 > sahi_inference.MODEL_PATH
+    default_ckpt: str = r"experiments\overnight_20260927\models\best_model.pth"
     
     # ============================================================
     # 路径参数

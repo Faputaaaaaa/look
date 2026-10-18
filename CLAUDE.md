@@ -36,6 +36,12 @@
 ## 工作流
 - 长任务用 `tmux` / `nohup`，日志写文件（不要只打屏幕）。
 - **每阶段结束更新 HANDOFF.md / STATUS.md 并 git commit**。
+- **运行环境**：必须用 `D:\Python3.14\python.exe`（torch+cu126 / PyQt5 装在该解释器上）。
+- **平台回归**（改动 `defect_platform/` 或 `sahi_inference.py` 后必做）：
+  - `python defect_platform/smoke_ui.py` —— 界面链路冒烟（不弹窗，5 步检查）
+  - `python defect_platform/smoke_test.py --n 1` —— 产出效果图，肉眼核对框
+- **推理口径单一来源**：任何入口（评估脚本 / 平台 / 冒烟）都必须走
+  `sahi_inference.sahi_inference_image()`，不要另写一份切片/后处理逻辑。
 
 ## 关键数据尺寸（参考）
 - 原图 4096×2736；切片 640×640，stride 320。
