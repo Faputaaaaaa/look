@@ -102,3 +102,6 @@ Thumbs.db
 # --- 最终例外（必须放在所有忽略规则之后：gitignore 后匹配者优先） ---
 # 上面的 "smoke_test.py" 是根目录诊断脚本规则，会误伤平台冒烟测试
 !defect_platform/smoke_test.py
+# 文档用界面截图需要入库（*.png 默认忽略）
+!docs/images/
+!docs/images/*.png

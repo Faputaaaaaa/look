@@ -6,6 +6,13 @@
 2026-09-27 夜间训练 `overnight_20260927`（20 epoch）已完成并出报告（TRAIN_REPORT.md + val_metrics.json，mAP@0.5=0.7788）。2026-09-29 完成 A14 dy 补偿实验（标定+诚实验证，结论：无净收益，保持默认关闭）。
 
 ## 已完成（新增 2026-10-19）
+- **实时监测 PR4-A**（交付包 `look-PR4A-实时视频监测-浅色前端-代码交付`，分支 `feat/pr4-live-inspection`）：
+  1. `live_ui.py`：PrintSight 实时监测页，支持摄像头 / 视频文件 / RTSP、ROI 拖拽、1.5px 细框、预览 FPS 与 AI 推理耗时分开显示。
+  2. `live_core.py`：容量 1 的最新帧邮箱（慢模型不排队）、ROI 裁切与 bbox 回映、LK 光流短时跟踪、过期结果丢弃；纯 CPU 可测。
+  3. `platform_ui.py`：新增「实时监测」入口并**复用已加载模型**（切换不重复占 GPU）、`--live` 启动；右侧信息面板改 `QScrollArea`。
+  4. 修掉补丁初版真实缺陷：旧深色 `_apply_qss()` 在浅色主题之前执行，子控件 palette 残留 `#0f1115`（右侧面板深底深字）→ 删除该方法，只保留 `LIGHT_THEME`。
+  5. 验收：`test_live_core` 15/15、全量单测 64/64、`py_compile` 通过；offscreen 实际渲染两窗口，截图 `docs/images/pr4_live_ui.png` / `pr4_static_ui.png`。
+  6. **未验证**：真实摄像头/MP4/RTSP 取流、模型 GPU 推理时延与吞吐、10 分钟稳定性、跨瓶跟踪与产线触发（需现场验收）。
 - **多缺陷训练 PR3 v2**（交付包 `look-PR3-v2-适配最新提交-8bf0346`，opt-in，默认不影响旧训练口径）：
   1. `roi_training.py`：训练/验证 loss 专用 **GT proposal 注入 + GT 覆盖采样**——每个真实缺陷保证一个正例（防"极差 proposal 保底错标正类"）；**推理仍只用 RPN**。
   2. `manifest_training.py`：从 PR2 manifest + group split 构建训练数据：同图多实例多类别、跨窗严重截断缺陷**不误标背景**、负窗每图限 2、`test_unseen_sku` 禁入训练；复用 `unique_sahi_windows` 与 SAHI 同口径。

@@ -1,0 +1,2 @@
+# Ensure Windows cmd.exe launcher uses CRLF on checkout.
+defect_platform/start_live.bat text eol=crlf
