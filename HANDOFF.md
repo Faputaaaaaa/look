@@ -6,6 +6,14 @@
 2026-09-27 夜间训练 `overnight_20260927`（20 epoch）已完成并出报告（TRAIN_REPORT.md + val_metrics.json，mAP@0.5=0.7788）。2026-09-29 完成 A14 dy 补偿实验（标定+诚实验证，结论：无净收益，保持默认关闭）。
 
 ## 已完成（新增 2026-10-19）
+- **多缺陷训练 PR3 v2**（交付包 `look-PR3-v2-适配最新提交-8bf0346`，opt-in，默认不影响旧训练口径）：
+  1. `roi_training.py`：训练/验证 loss 专用 **GT proposal 注入 + GT 覆盖采样**——每个真实缺陷保证一个正例（防"极差 proposal 保底错标正类"）；**推理仍只用 RPN**。
+  2. `manifest_training.py`：从 PR2 manifest + group split 构建训练数据：同图多实例多类别、跨窗严重截断缺陷**不误标背景**、负窗每图限 2、`test_unseen_sku` 禁入训练；复用 `unique_sahi_windows` 与 SAHI 同口径。
+  3. `train.py`：`--manifest/--split-json/--data-root/--gt-aware-roi` 入口；manifest 模式自动开 GT-aware、禁止 `--resume` 与旧 val-metrics 混用；默认无参数走旧路径。
+  4. `dataset.py` 超 `max_objects` 从静默截断改为报错；`config.use_gt_aware_roi_training=False`。
+  5. 验收：**单测 49/49**（PR1 7 + PR2 16 + PR3 26）；train.py --help 冒烟通过。
+  6. 补丁 3 处 hunk（config.py、train.py parse_args、main 数据加载）因空行空格差异 `git apply` 失败，已按 .rej 手工等价应用并删除 .rej。
+  7. 已推：ACAMLab/Defect-Supervised（c4d312b）、Faputaaaaaa/look（003072c，快进）。
 - **多缺陷推理 PR1**（微信文件 `look-pr1-multidefect-inference.patch`，为后续"一图多缺陷"数据集做准备）：
   1. `model_fpn.py` 窗口内 NMS → **类别感知 NMS**（`class_aware_keep`）：不同类重叠框共存，同类重复才抑制。
   2. `sahi_inference.py` 窗口枚举 → `unique_sahi_windows` 去重：4096×2736 下 117 切片 → **96 切片**（老代码靠边窗口重复推理 ~43%），覆盖范围不变；单图耗时 21~25s → 15~17s。
@@ -54,7 +62,8 @@
 
 ## 下一步
 1. 决定 dirty 提升方向（见上"未完成"第 1 条，建议先查标注一致性，成本最低）。
-2. 多缺陷数据集到位后：制作 manifest（按 `docs/PR2_DATA_EVAL.md` 合同）→ `tools.build_group_split` → `tools.export_multi_predictions` → `tools.evaluate_multi_instance`；Top-K 标定（`config.max_dets_per_image`）。
+2. 多缺陷数据集到位后：制作 manifest（按 `docs/PR2_DATA_EVAL.md` 合同）→ `tools.build_group_split` 分组划分 → 用 `train.py --manifest ... --split-json ... --data-root ...` 训练（自动 GT-aware）→ 训练后用 PR2 工具按新口径评估（multi_class_all_found_rate 等）。
+3. PR3 训练前先复核 dirty 标注一致性；GT 注入不解决 RPN 召回问题，训练后要报告 RPN recall。
 3. 如继续训练：`python train.py --exp <name>`（改动已就位）。
 4. P2 收尾项见上。
 
