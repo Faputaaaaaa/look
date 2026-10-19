@@ -36,6 +36,7 @@ from model_fpn import (
     assign_levels_and_roi_align,  # [P0.5] 统一 FPN 层分配 + roi_align
 )
 from dataset import DefectDataset, create_dataloader
+from roi_training import append_gt_proposals, sample_gt_aware_rois
 from utils import logger
 # from evaluate import draw_loss_curves  # 已移除：evaluate.py不存在，曲线绘制改用tracker.save_curves()
 
@@ -789,6 +790,10 @@ def train_one_epoch(model, train_loader, optimizer, rpn_trainer, device, img_siz
             proposals, _ = extract_rpn_proposals(
                 model, rpn_cls_preds, rpn_bbox_preds, fpn_features, anchors_dict,
                 img_size=img_size, batch_idx=b)
+            if config.use_gt_aware_roi_training:
+                # 训练 loss 专用：每个真实缺陷注入一个高质量正 proposal。
+                # 推理阶段仍然只使用模型自行产生的 RPN proposals。
+                proposals, rpn_count = append_gt_proposals(proposals, gt_boxes)
             if proposals.size(0) == 0:
                 continue
 
@@ -860,6 +865,13 @@ def train_one_epoch(model, train_loader, optimizer, rpn_trainer, device, img_siz
                 else:
                     neg_inds = raw_neg_inds[:num_neg] if raw_neg_inds.size(0) > 0 else raw_neg_inds
             
+            if config.use_gt_aware_roi_training:
+                # 旧 top-IoU 保底可能把近乎无交叠的 proposal 错标为正类；
+                # 在新实验模式下，以每个 GT 的注入 proposal 保证正例覆盖。
+                pos_inds, neg_inds = sample_gt_aware_rois(
+                    roi_orig_indices, roi_pos_mask, roi_neg_mask,
+                    original_rpn_count=rpn_count, gt_count=gt_boxes.size(0),
+                )
             sampled_inds = torch.cat([pos_inds, neg_inds])
             
             sampled_cls_logits = cls_logits[sampled_inds]
@@ -1016,6 +1028,9 @@ def validate(model, val_loader, rpn_trainer, device, img_size):
                 proposals, _ = extract_rpn_proposals(
                     model, rpn_cls_preds, rpn_bbox_preds, fpn_features, anchors_dict,
                     img_size=img_size, batch_idx=b)
+                if config.use_gt_aware_roi_training:
+                    # 与 train 对齐；这里仅计算验证 loss，不修改实际评估推理。
+                    proposals, rpn_count = append_gt_proposals(proposals, gt_boxes)
                 if proposals.size(0) == 0:
                     continue
 
@@ -1074,6 +1089,11 @@ def validate(model, val_loader, rpn_trainer, device, img_size):
                     else:
                         neg_inds = raw_neg_inds_val
 
+                if config.use_gt_aware_roi_training:
+                    pos_inds, neg_inds = sample_gt_aware_rois(
+                        roi_orig_indices, roi_pos_mask, roi_neg_mask,
+                        original_rpn_count=rpn_count, gt_count=gt_boxes.size(0),
+                    )
                 sampled_inds = torch.cat([pos_inds, neg_inds])
 
                 sampled_cls_logits = cls_logits[sampled_inds]
@@ -1349,12 +1369,29 @@ def parse_args():
                         help='总 epoch 数（覆盖默认 stage1+stage2）')
     parser.add_argument('--val-metrics-every', type=int, default=0,
                         help='每 N epoch 跑一次轻量 mAP 验证（0=关）')
+    # PR3: explicit opt-in to PR2's group-isolated, multi-instance manifest.
+    parser.add_argument('--manifest', type=str, default=None,
+                        help='PR2 manifest JSON（多缺陷训练入口；需要 --split-json）')
+    parser.add_argument('--split-json', type=str, default=None,
+                        help='由 tools.build_group_split 生成的 group split JSON')
+    parser.add_argument('--data-root', type=str, default='.',
+                        help='manifest 图片相对路径的根目录')
+    parser.add_argument('--gt-aware-roi', action='store_true',
+                        help='启用 GT proposal 正例覆盖采样；多缺陷 manifest 模式自动启用')
     return parser.parse_args()
 
 
 def main():
     """主函数。"""
     args = parse_args()
+    if bool(args.manifest) != bool(args.split_json):
+        raise ValueError('--manifest 与 --split-json 必须同时提供')
+    if args.manifest and args.val_metrics_every:
+        raise ValueError('manifest 模式不能运行旧 split.json 的 val-metrics；使用 PR2 独立评估命令')
+    if args.manifest and args.resume:
+        raise ValueError('manifest 模式禁止从旧优化器 --resume；请另行实现显式 --init-weights 微调')
+    if args.manifest or args.gt_aware_roi:
+        config.use_gt_aware_roi_training = True
     if args.exp:
         # 覆盖实验名，并重新推导派生路径（__post_init__ 已在 import 时跑过）
         config.experiment_name = args.exp
@@ -1393,18 +1430,25 @@ def main():
     
     # 加载数据
     logger.info("正在加载数据集...")
-    # [R24] xinpaide：合并dirty+missing，按8:2划分
-    # 训练集：每子集前80张，验证集：每子集后20张（无重叠）
-    train_loader = create_dataloader(
-        config.train_img_dirs, config.train_label_dirs,
-        mode='train', max_samples_per_dir=config.train_samples_per_subset,
-        from_end=False
-    )
-    val_loader = create_dataloader(
-        config.val_img_dirs, config.val_label_dirs,
-        mode='val', max_samples_per_dir=config.val_samples_per_subset,
-        from_end=True
-    )
+    if args.manifest:
+        from manifest_training import make_manifest_loaders
+        train_loader, val_loader = make_manifest_loaders(
+            args.manifest, args.split_json, args.data_root
+        )
+        print('[PR3] 多缺陷 manifest 训练：使用 PR2 分组划分，GT-aware ROI 已开启')
+    else:
+        # [R24] xinpaide：合并dirty+missing，按8:2划分
+        # 训练集：每子集前80张，验证集：每子集后20张（无重叠）
+        train_loader = create_dataloader(
+            config.train_img_dirs, config.train_label_dirs,
+            mode='train', max_samples_per_dir=config.train_samples_per_subset,
+            from_end=False
+        )
+        val_loader = create_dataloader(
+            config.val_img_dirs, config.val_label_dirs,
+            mode='val', max_samples_per_dir=config.val_samples_per_subset,
+            from_end=True
+        )
     
     logger.info(f"训练集: {len(train_loader.dataset)}张, 验证集: {len(val_loader.dataset)}张")
     

@@ -826,7 +826,13 @@ class DefectDataset(Dataset):
         """
         padded = np.zeros((self.max_objects, 5), dtype=np.float32)
         
-        num_bboxes = min(len(bboxes), self.max_objects)
+        # 多缺陷不能默默丢掉尾部 GT：num_objects 必须与实际标签一致。
+        if len(bboxes) > self.max_objects:
+            raise ValueError(
+                f"一张切片包含 {len(bboxes)} 个 GT，超过 config.max_objects={self.max_objects}；"
+                "请增加 max_objects 或排查标注。"
+            )
+        num_bboxes = len(bboxes)
         if num_bboxes > 0:
             padded[:num_bboxes] = bboxes[:num_bboxes]
         
