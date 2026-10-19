@@ -3,6 +3,15 @@
 > 快速一览，细节见 HANDOFF.md。
 
 ## 最新状态（2026-10-19）
+- **多缺陷训练 PR3 v2 已合入**（基于 8bf0346；opt-in，默认不影响旧训练口径）：
+  - `roi_training.py`：GT proposal 注入 + GT 覆盖采样（仅训练/验证 loss，推理仍只用 RPN）；
+    `manifest_training.py`：PR2 manifest → 训练数据（同图多实例、截断缺陷不误标背景、test_unseen_sku 禁入训练）。
+  - `train.py` 新入口 `--manifest/--split-json/--data-root/--gt-aware-roi`；manifest 模式禁止 `--resume`/旧 val-metrics。
+  - `dataset.py` 超 max_objects 不再静默截断；`config.use_gt_aware_roi_training=False`。
+  - 验收：单测 49/49（PR1 7 + PR2 16 + PR3 26）；train.py --help 冒烟通过。
+  - 注意：补丁 3 处 hunk 因空行空格差异 git apply 失败，已按 .rej 手工等价应用。
+  - 已推：ACAMLab/Defect-Supervised（c4d312b）、Faputaaaaaa/look（003072c，快进）。
+  - **待真实多缺陷 manifest 到位后**：`python train.py --manifest ... --split-json ... --data-root ... --exp pr3_multi_01`，并用 PR2 工具按新口径评估。
 - **多缺陷评测 PR2 已合入**（纯新增模块，不改 split.json/训练/平台）：
   - `quality/`（manifest 契约 + 类别感知多实例 AP50/P/R + 分组隔离划分 + 整 SKU 留出）、
     `tools/`（build_group_split / export_multi_predictions / evaluate_multi_instance）、`docs/`、16 项单测。
@@ -13,7 +22,8 @@
   - 移除 `final >= MAX_DET*2` 提前截断；新增 `inference_utils.py` + 7 个无权重回归测试。
   - 回归：单测 7/7、smoke_ui 5/5、smoke_test（missing IoU 0.742 / dirty 0.825，与打补丁前一致）。
   - 顺手修复 smoke_ui.py GBK 控制台 emoji 打印崩溃（退出码 127）。
-- **GitHub 同步（2026-10-18）**：代码已推送至 `https://github.com/ACAMLab/Defect-Supervised`（main @ eb454b6，含 26 个提交）。
+- **GitHub 同步（2026-10-19）**：`Faputaaaaaa/look`（公开）main @ 003072c（PR1+PR2+PR3 快进合入）；
+  `ACAMLab/Defect-Supervised`（私有）main @ c4d312b（PR1+PR2+PR3，历史已用 filter-branch 抹除 `.trae/` 个人笔记）。
   - 已上传：核心代码、`defect_platform/`、诊断脚本、`requirements.txt`、文档。
   - 未上传：数据集、`experiments/`、`exp_logs/`、平台 `outputs/`、`.workbuddy/`。
 - 训练 `overnight_20260927`（20 epoch）已完成，**mAP@0.5 = 0.7788**。
