@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import resnet18
 from torchvision.ops import nms, roi_align
+from inference_utils import class_aware_keep
 import numpy as np
 from typing import List, Tuple, Dict, Optional
 from config import config
@@ -785,9 +786,11 @@ class TwoStageDetector(nn.Module):
             final_scores = scores[valid_mask]
             final_labels = labels[valid_mask]
 
-            # Step 4: NMS去重 + 最多max_detections个
-            keep = nms(final_boxes, final_scores, INFERENCE_CONFIG['nms_thresh'])
-            keep = keep[:INFERENCE_CONFIG['max_detections']]
+            # Step 4: category-aware NMS; overlapping different classes survive.
+            # This is multi-instance detection, not multi-label prediction for one ROI.
+            keep = class_aware_keep(
+                final_boxes, final_scores, final_labels,
+                INFERENCE_CONFIG['nms_thresh'], INFERENCE_CONFIG['max_detections'])
 
             all_boxes.append(final_boxes[keep])
             all_scores.append(final_scores[keep])

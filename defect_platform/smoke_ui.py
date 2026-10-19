@@ -37,7 +37,8 @@ def main():
     w = pu.PlatformUI(a.model)
 
     def fail(msg):
-        print('❌', msg)
+        # [平台 2026-10-19] 不用 ❌ emoji：GBK 控制台（cp936）打印会 UnicodeEncodeError。
+        print('[FAIL]', msg)
         app.exit(1)
 
     def step_wait_model():
@@ -85,7 +86,8 @@ def main():
         if expect_cols != 4:
             fail(f'明细表列数异常: {expect_cols}')
             return
-        print('[5/5] 全部通过 ✅')
+        # [平台 2026-10-19] 不用 ✅ emoji：GBK 控制台（cp936）打印会 UnicodeEncodeError，导致退出码 127。
+        print('[5/5] 全部通过 OK')
         app.quit()
 
     QTimer.singleShot(200, step_wait_model)
