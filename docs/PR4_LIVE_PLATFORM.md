@@ -94,5 +94,8 @@ python -m py_compile defect_platform/platform_ui.py defect_platform/live_ui.py \
 
 ## GitHub 状态
 
-代码推送至 `Faputaaaaaa/look` 分支 `feat/pr4-live-inspection`，对应 Pull Request 见该仓库的 Pull requests 页面。
+- 仓库：`Faputaaaaaa/look`，基线 `main` @ `767724cf47c507d9388e3988887cd581a34d090b`
+- 分支：`feat/pr4-live-inspection`（功能提交 `8aba7b9`，其后仅追加本文档的状态更新）
+- Pull Request：<https://github.com/Faputaaaaaa/look/pull/1>
+
 本 PR 只新增实时监测模块与浅色主题改动，不改训练/评估口径，也不改动 `model_fpn.py`、`sahi_inference.py` 的既有行为。
