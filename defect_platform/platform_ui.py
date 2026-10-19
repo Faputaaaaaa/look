@@ -42,7 +42,7 @@ try:
         QVBoxLayout, QFileDialog, QSplitter, QRadioButton, QGroupBox,
         QGridLayout, QFormLayout, QMessageBox, QTableWidget, QTableWidgetItem,
         QHeaderView, QListWidget, QProgressBar, QSlider, QComboBox, QCheckBox,
-        QAbstractItemView,
+        QAbstractItemView, QScrollArea, QFrame,
     )
     from PyQt5.QtGui import QImage, QPixmap
     from PyQt5.QtCore import Qt, QThread, pyqtSignal
@@ -53,7 +53,7 @@ except ImportError:
         QVBoxLayout, QFileDialog, QSplitter, QRadioButton, QGroupBox,
         QGridLayout, QFormLayout, QMessageBox, QTableWidget, QTableWidgetItem,
         QHeaderView, QListWidget, QProgressBar, QSlider, QComboBox, QCheckBox,
-        QAbstractItemView,
+        QAbstractItemView, QScrollArea, QFrame,
     )
     from PySide6.QtGui import QImage, QPixmap
     from PySide6.QtCore import Qt, QThread
@@ -193,11 +193,14 @@ class PlatformUI(QMainWindow):
         main = QWidget()
         self.setCentralWidget(main)
         root = QVBoxLayout(main)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(6)
+        root.setContentsMargins(20, 18, 20, 18)
+        root.setSpacing(12)
 
         # ---- 工具栏 ----
         tool = QHBoxLayout()
+        self.btn_live = QPushButton("● 实时监测")
+        self.btn_live.setObjectName("live")
+        self.btn_live.clicked.connect(self.open_live)
         self.btn_open = QPushButton("📂 打开图片"); self.btn_open.clicked.connect(self.open_file)
         self.btn_dir = QPushButton("📁 打开文件夹"); self.btn_dir.clicked.connect(self.open_dir)
         self.btn_prev = QPushButton("◀ 上一张"); self.btn_prev.clicked.connect(lambda: self.goto(self.cur_idx - 1))
@@ -210,7 +213,7 @@ class PlatformUI(QMainWindow):
         self.stop_btn.clicked.connect(self.stop_detect)
         self.btn_save = QPushButton("💾 保存结果图"); self.btn_save.clicked.connect(self.save_res)
         self.btn_export = QPushButton("📋 导出明细"); self.btn_export.clicked.connect(self.export_txt)
-        for b in (self.btn_open, self.btn_dir, self.btn_prev, self.btn_next, self.run_btn,
+        for b in (self.btn_live, self.btn_open, self.btn_dir, self.btn_prev, self.btn_next, self.run_btn,
                   self.batch_btn, self.stop_btn, self.btn_save, self.btn_export):
             tool.addWidget(b)
         tool.addStretch()
@@ -274,8 +277,8 @@ class PlatformUI(QMainWindow):
         g2 = QGroupBox("检测统计")
         l2 = QVBoxLayout()
         self.lbl_total = QLabel("总缺陷数: 0")
-        self.lbl_missing = QLabel("missing: 0"); self.lbl_missing.setStyleSheet("color:#ffc800")
-        self.lbl_dirty = QLabel("dirty: 0"); self.lbl_dirty.setStyleSheet("color:#ff5050")
+        self.lbl_missing = QLabel("missing: 0"); self.lbl_missing.setStyleSheet("color:#B26B00")
+        self.lbl_dirty = QLabel("dirty: 0"); self.lbl_dirty.setStyleSheet("color:#C0392B")
         for w in (self.lbl_total, self.lbl_missing, self.lbl_dirty):
             l2.addWidget(w)
         g2.setLayout(l2); ply.addWidget(g2)
@@ -301,8 +304,16 @@ class PlatformUI(QMainWindow):
         g6.setLayout(l6); ply.addWidget(g6, 1)
 
         ply.addStretch()
+        # 右侧面板内容在 900px 高度下会被压缩重叠，改为可滚动，卡片保持自然高度。
+        panel_scroll = QScrollArea()
+        panel_scroll.setWidgetResizable(True)
+        panel_scroll.setFrameShape(QFrame.NoFrame)
+        panel_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        panel_scroll.setWidget(panel)
+        panel_scroll.setMinimumWidth(320)
+        panel_scroll.setMaximumWidth(380)
         disp.addWidget(left)
-        disp.addWidget(panel)
+        disp.addWidget(panel_scroll)
         disp.setStretchFactor(0, 3)
         disp.setStretchFactor(1, 1)
 
@@ -313,10 +324,18 @@ class PlatformUI(QMainWindow):
         self.progress.setValue(0)
         self.progress.setFixedWidth(260)
         self.lbl_status = QLabel("初始化...")
-        self.lbl_status.setStyleSheet("background:#1b2029; color:#ddd; padding:5px")
+        self.lbl_status.setStyleSheet("background:#E7F2FC; color:#28577A; padding:9px; border-radius:7px")
         bottom.addWidget(self.progress)
         bottom.addWidget(self.lbl_status, 1)
 
+        hero = QVBoxLayout()
+        hero_title = QLabel("PrintSight  /  智能丝印质检")
+        hero_title.setObjectName("pageTitle")
+        hero_sub = QLabel("静态分析  ·  自研两阶段检测  ·  切换实时监测查看摄像头画面")
+        hero_sub.setObjectName("pageSub")
+        hero.addWidget(hero_title)
+        hero.addWidget(hero_sub)
+        root.addLayout(hero)
         root.addLayout(tool)
         root.addWidget(disp, 1)
         root.addLayout(bottom)
@@ -325,31 +344,28 @@ class PlatformUI(QMainWindow):
             r.toggled.connect(self._warn_recheck)
         self.slider.valueChanged.connect(self._warn_recheck)
         self.cmb_topk.currentIndexChanged.connect(self._warn_recheck)
-        self._apply_qss()
+        # 只应用浅色主题：先前的深色 QSS 会残留到子控件 palette，
+        # 导致右侧面板仍是深底深字（不可读）。
+        from defect_platform.theme import LIGHT_THEME
+        self.setStyleSheet(LIGHT_THEME)
+
+    def open_live(self):
+        """Reuse the loaded model; do not allocate a second 8GB GPU copy."""
+        if self.detector is None:
+            self._set_status("请等待模型加载完成后进入实时监测")
+            return
+        if self.worker and self.worker.isRunning():
+            self._set_status("请先停止静态图检测，再切换实时模式")
+            return
+        from defect_platform.live_ui import LiveWindow
+        self.live_window = LiveWindow(detector=self.detector)
+        self.live_window.closed.connect(self.show)
+        self.live_window.show()
+        self.hide()
 
     def _warn_recheck(self, *_a):
         if self.results:
             self._set_status("⚠ 参数已改：对已检测图片需重新检测才会更新")
-
-    def _apply_qss(self):
-        self.setStyleSheet("""
-        QWidget { background:#0f1115; color:#ddd; font-family:Microsoft YaHei UI; font-size:12px; }
-        QLabel { background:transparent; border:none; color:#ccc; }
-        QGroupBox { border:1px solid #384152; border-radius:6px; margin-top:10px;
-                    padding-top:8px; font-weight:bold; color:#8ab4f8; }
-        QGroupBox::title { subcontrol-origin:margin; left:10px; padding:0 4px; }
-        QPushButton { background:#232834; border:1px solid #384152; padding:6px 12px;
-                      border-radius:4px; }
-        QPushButton:hover { background:#2b3140; }
-        QPushButton:disabled { background:#1b2029; color:#666; }
-        QTableWidget, QListWidget { background:#151922; border:1px solid #384152;
-                                    gridline-color:#2a2f3a; }
-        QHeaderView::section { background:#232834; color:#ccc; border:none; padding:4px; }
-        QRadioButton, QCheckBox { padding:2px; }
-        QProgressBar { background:#151922; border:1px solid #384152; border-radius:4px;
-                       text-align:center; color:#ccc; }
-        QProgressBar::chunk { background:#3d7eff; }
-        """)
 
     # ---------------- 模型 ----------------
     def load_model(self):
@@ -627,10 +643,15 @@ class PlatformUI(QMainWindow):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--model', default=None, help='checkpoint 路径（默认 config.default_ckpt）')
+    ap.add_argument('--live', action='store_true', help='直接打开实时监测界面')
     args, _unknown = ap.parse_known_args()
 
     app = QApplication(sys.argv)
-    w = PlatformUI(args.model)
+    if args.live:
+        from defect_platform.live_ui import LiveWindow
+        w = LiveWindow(model_path=args.model)
+    else:
+        w = PlatformUI(args.model)
     w.show()
     sys.exit(app.exec_() if hasattr(app, 'exec_') else app.exec())
 
