@@ -14,6 +14,12 @@
 - **平台冒烟修复**：`smoke_ui.py` 的 ✅/❌ emoji 在 GBK 控制台打印 UnicodeEncodeError → 5 步全过但退出码 127；已换 ASCII 标记。
 - **回归通过**：单测 7/7；`smoke_ui.py` 5/5 退出码 0；`smoke_test.py --n 1` → 96 切片/张，missing IoU 0.742 / dirty 0.825（与打补丁前一致）。效果图 `defect_platform/outputs/smoke_20261019_172330/`。
 - **结论：当前单缺陷数据集下该补丁行为中性**（不同类框重叠基本不发生、top-k 兜底不变），无需重新评估 mAP 口径；等新数据集到位后需做 Top-K 标定（`config.max_dets_per_image`）与按新数据重定评估口径。
+- **多缺陷评测 PR2**（交付包 `look-PR1-PR2-阶段改造交付包.zip` 的 02 补丁）：纯新增独立模块，**不改 split.json / train.py / model_fpn.py / 平台**：
+  1. `quality/`：`manifest.py`（多缺陷 GT manifest 契约校验）、`metrics.py`（类别感知多实例匹配 + VOC all-point AP50 + 多实例/多类别全检率、正常瓶误报率）、`split.py`（按 capture_group 隔离分组划分 + 整 SKU 留出 heldout + 泄漏检测）。
+  2. `tools/`：`build_group_split.py`（生成分组划分，拒绝覆盖 split.json）、`export_multi_predictions.py`（走 `sahi_inference_image` 单一口径，低 score_floor 导出）、`evaluate_multi_instance.py`（离线评测，无需 torch）。
+  3. `docs/PR2_DATA_EVAL.md` + `docs/技术架构方案.md`（五阶段路线：PR3 多缺陷数据/训练、PR4 批处理实时化、PR5 未见瓶型泛化）。
+  4. `tests/test_quality.py` 16 项单测。
+- **PR2 验收**：单测 16/16、全套 23/23、patch `git apply --check` 通过；CLI 联调：合成 manifest（一图两类+留出 SKU）build_group_split/evaluate 通过（multi_class_all_found=1.0）；真实图+overnight 权重 export/evaluate 全链路通过（top 检出 dirty@0.999 命中 GT，score_floor=0.05 下 7 个低分 FP 属预期）。**注意：真实多缺陷标注的 manifest 尚未制作**，等数据到位后按 `docs/PR2_DATA_EVAL.md` 的 contract 建。
 
 ## 已完成（2026-09-27 及之前）
 - **A13 背景窗口负样本日志监控** —— `RPNTrainer.reset_stats()` + `compute_loss` 统计 + 每 epoch 打印两个负样本来源。
@@ -48,7 +54,7 @@
 
 ## 下一步
 1. 决定 dirty 提升方向（见上"未完成"第 1 条，建议先查标注一致性，成本最低）。
-2. 多缺陷数据集到位后：Top-K 标定（`config.max_dets_per_image`）+ 按新数据重定评估口径（PR1 已把 NMS/窗口/截断三处修好）。
+2. 多缺陷数据集到位后：制作 manifest（按 `docs/PR2_DATA_EVAL.md` 合同）→ `tools.build_group_split` → `tools.export_multi_predictions` → `tools.evaluate_multi_instance`；Top-K 标定（`config.max_dets_per_image`）。
 3. 如继续训练：`python train.py --exp <name>`（改动已就位）。
 4. P2 收尾项见上。
 

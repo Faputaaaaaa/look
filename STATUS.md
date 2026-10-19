@@ -3,6 +3,11 @@
 > 快速一览，细节见 HANDOFF.md。
 
 ## 最新状态（2026-10-19）
+- **多缺陷评测 PR2 已合入**（纯新增模块，不改 split.json/训练/平台）：
+  - `quality/`（manifest 契约 + 类别感知多实例 AP50/P/R + 分组隔离划分 + 整 SKU 留出）、
+    `tools/`（build_group_split / export_multi_predictions / evaluate_multi_instance）、`docs/`、16 项单测。
+  - 验收：单测 16/16、全套 23/23；合成 CLI 联调（多类别全检率 1.0）与真实图+overnight 权重全链路联调通过。
+  - 待数据到位：制作真实多缺陷 manifest（见 `docs/PR2_DATA_EVAL.md` 合同）。
 - **多缺陷推理 PR1 已合入**（为"一图多缺陷"数据集做准备，当前单缺陷数据下行为中性）：
   - 窗口内 NMS → 类别感知 NMS（不同类重叠框共存）；窗口枚举去重 117→96 切片（单图 15~17s）；
   - 移除 `final >= MAX_DET*2` 提前截断；新增 `inference_utils.py` + 7 个无权重回归测试。
@@ -22,7 +27,7 @@
   - 开关代码已就位并冒烟测试通过（`config.use_dy_compensation`，默认 False）。
 
 ## 待办（下次）
-- 多缺陷数据集到位后：Top-K 标定（`config.max_dets_per_image`）+ 按新数据重定评估口径（NMS/窗口/截断已修）。
+- 多缺陷数据集到位后：制作 manifest（`docs/PR2_DATA_EVAL.md` 合同）→ 分组划分 → 导出预测 → 评测；Top-K 标定（`config.max_dets_per_image`）。
 - 决定 dirty 提升方向：① 查标注一致性（推荐，成本最低）② 形状回归修复 ③ 接受现状。
 - A11-余: missing 扩张若启用建议 1.08x（dirty 已无需扩张）。
 - P2 收尾: A12 stale 注释、B4/B5 anchor 缓存、C4 GC10DET 隔离。
