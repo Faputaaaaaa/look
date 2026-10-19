@@ -13,7 +13,8 @@
   - 移除 `final >= MAX_DET*2` 提前截断；新增 `inference_utils.py` + 7 个无权重回归测试。
   - 回归：单测 7/7、smoke_ui 5/5、smoke_test（missing IoU 0.742 / dirty 0.825，与打补丁前一致）。
   - 顺手修复 smoke_ui.py GBK 控制台 emoji 打印崩溃（退出码 127）。
-- **GitHub 同步（2026-10-19）**：代码已推送至 `https://github.com/ACAMLab/Defect-Supervised`（main @ 5cca262，含 29 个提交）。
+- **GitHub 同步（2026-10-19）**：代码已推送至 `https://github.com/ACAMLab/Defect-Supervised`（main @ 439f0b6，含 29 个提交）。
+  - 历史已用 filter-branch 抹除 `.trae/` 个人笔记（全部提交），准备公开仓库。
   - 已上传：核心代码、`defect_platform/`、诊断脚本、`requirements.txt`、文档。
   - 未上传：数据集、`experiments/`、`exp_logs/`、平台 `outputs/`、`.workbuddy/`。
 - 训练 `overnight_20260927`（20 epoch）已完成，**mAP@0.5 = 0.7788**。
