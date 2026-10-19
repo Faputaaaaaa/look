@@ -21,6 +21,7 @@ from torchvision.ops import nms
 from config import config
 from model_fpn import TwoStageDetector, FPN_CONFIG, INFERENCE_CONFIG
 from dataset import DefectDataset
+from inference_utils import unique_sahi_windows
 
 # ============ 配置 ============
 # [R40] 历史默认（保留备注，勿删）：experiments\exp_20260812_093621\models\best_model.pth
@@ -159,17 +160,8 @@ def sahi_inference_image(model, img, score_thresh=None, max_dets=None, progress=
     thr = float(SCORE_THRESH if score_thresh is None else score_thresh)
     keep_k = max(1, int(config.max_dets_per_image if max_dets is None else max_dets))
 
-    # [平台 2026-09-29] 先枚举窗口，便于回调切片级进度（UI 进度条）。
-    windows = []
-    for y in range(0, ih, STRIDE):
-        for x in range(0, iw, STRIDE):
-            x2 = min(x + WINDOW, iw)
-            y2 = min(y + WINDOW, ih)
-            x1 = max(0, x2 - WINDOW)
-            y1 = max(0, y2 - WINDOW)
-            if x2 - x1 < 64 or y2 - y1 < 64:
-                continue
-            windows.append((x1, y1, x2, y2))
+    # Same edge coverage, without re-inferencing duplicated clamped windows.
+    windows = unique_sahi_windows(iw, ih, WINDOW, STRIDE)
 
     all_dets = []
     total = max(1, len(windows))
@@ -222,8 +214,7 @@ def sahi_inference_image(model, img, score_thresh=None, max_dets=None, progress=
                 cls_boxes[i, 2].item(), cls_boxes[i, 3].item(),
                 cls_scores[i].item(), cls
             ))
-        if len(final) >= MAX_DET * 2:
-            break
+        # Do not stop early: later defect classes must not be silently discarded.
 
     # [R38] top-k：数据集每张原图只有 1 个缺陷 → 默认 max_dets_per_image=1（= 评估口径）。
     # [平台] 产线可能一图多缺陷，keep_k 可由 config.max_dets_per_image / 平台 UI 调大。

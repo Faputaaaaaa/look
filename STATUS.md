@@ -2,7 +2,12 @@
 
 > 快速一览，细节见 HANDOFF.md。
 
-## 最新状态（2026-09-29）
+## 最新状态（2026-10-19）
+- **多缺陷推理 PR1 已合入**（为"一图多缺陷"数据集做准备，当前单缺陷数据下行为中性）：
+  - 窗口内 NMS → 类别感知 NMS（不同类重叠框共存）；窗口枚举去重 117→96 切片（单图 15~17s）；
+  - 移除 `final >= MAX_DET*2` 提前截断；新增 `inference_utils.py` + 7 个无权重回归测试。
+  - 回归：单测 7/7、smoke_ui 5/5、smoke_test（missing IoU 0.742 / dirty 0.825，与打补丁前一致）。
+  - 顺手修复 smoke_ui.py GBK 控制台 emoji 打印崩溃（退出码 127）。
 - **GitHub 同步（2026-10-18）**：代码已推送至 `https://github.com/ACAMLab/Defect-Supervised`（main @ eb454b6，含 26 个提交）。
   - 已上传：核心代码、`defect_platform/`、诊断脚本、`requirements.txt`、文档。
   - 未上传：数据集、`experiments/`、`exp_logs/`、平台 `outputs/`、`.workbuddy/`。
@@ -17,6 +22,7 @@
   - 开关代码已就位并冒烟测试通过（`config.use_dy_compensation`，默认 False）。
 
 ## 待办（下次）
+- 多缺陷数据集到位后：Top-K 标定（`config.max_dets_per_image`）+ 按新数据重定评估口径（NMS/窗口/截断已修）。
 - 决定 dirty 提升方向：① 查标注一致性（推荐，成本最低）② 形状回归修复 ③ 接受现状。
 - A11-余: missing 扩张若启用建议 1.08x（dirty 已无需扩张）。
 - P2 收尾: A12 stale 注释、B4/B5 anchor 缓存、C4 GC10DET 隔离。
@@ -26,10 +32,10 @@
   （若报错，用 `D:\Python3.14\python.exe defect_platform\platform_ui.py`）。
 - 不开界面也能看效果：`python defect_platform/smoke_test.py --n 1`
   → 出图到 `defect_platform/outputs/smoke_<ts>/`（全图/缩略/放大裁剪 + summary.txt）。
-- 实测基线：单图 SAHI 21~25s（117 切片，4060 Laptop），missing IoU 0.74 / dirty 0.83。
+- 实测基线：单图 SAHI 15~17s（96 切片，去重后；原 117 切片 21~25s），missing IoU 0.74 / dirty 0.83。
 - 已修：默认权重口径（原 `sahi_inference.MODEL_PATH` 指向旧实验）、UI 主线程假死、
   临时 jpg 压缩损失、RGBA 花屏；requirements 补 PyQt5 + opencv-python。
-- 平台侧待办：速度优化（batch/FP16/stride）、一图多缺陷（Top-K 与 NMS 重新标定）、
+- 平台侧待办：速度优化（batch/FP16/stride）、一图多缺陷 Top-K 标定（NMS/窗口/截断三处已修，见最新状态）、
   实时视频/相机（`detector.detect_bgr` 已是内存数组入口，可直接复用）。
 
 ## 阻塞点

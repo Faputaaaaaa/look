@@ -5,6 +5,16 @@
 ## 当前阶段
 2026-09-27 夜间训练 `overnight_20260927`（20 epoch）已完成并出报告（TRAIN_REPORT.md + val_metrics.json，mAP@0.5=0.7788）。2026-09-29 完成 A14 dy 补偿实验（标定+诚实验证，结论：无净收益，保持默认关闭）。
 
+## 已完成（新增 2026-10-19）
+- **多缺陷推理 PR1**（微信文件 `look-pr1-multidefect-inference.patch`，为后续"一图多缺陷"数据集做准备）：
+  1. `model_fpn.py` 窗口内 NMS → **类别感知 NMS**（`class_aware_keep`）：不同类重叠框共存，同类重复才抑制。
+  2. `sahi_inference.py` 窗口枚举 → `unique_sahi_windows` 去重：4096×2736 下 117 切片 → **96 切片**（老代码靠边窗口重复推理 ~43%），覆盖范围不变；单图耗时 21~25s → 15~17s。
+  3. 移除 `if len(final) >= MAX_DET * 2: break` 提前截断（原会漏掉后面的缺陷类别）。
+  4. 新增 `inference_utils.py` + `tests/test_inference_utils.py`（7 个无权重回归测试，`python -m unittest discover -s tests -t . -v`）。
+- **平台冒烟修复**：`smoke_ui.py` 的 ✅/❌ emoji 在 GBK 控制台打印 UnicodeEncodeError → 5 步全过但退出码 127；已换 ASCII 标记。
+- **回归通过**：单测 7/7；`smoke_ui.py` 5/5 退出码 0；`smoke_test.py --n 1` → 96 切片/张，missing IoU 0.742 / dirty 0.825（与打补丁前一致）。效果图 `defect_platform/outputs/smoke_20261019_172330/`。
+- **结论：当前单缺陷数据集下该补丁行为中性**（不同类框重叠基本不发生、top-k 兜底不变），无需重新评估 mAP 口径；等新数据集到位后需做 Top-K 标定（`config.max_dets_per_image`）与按新数据重定评估口径。
+
 ## 已完成（2026-09-27 及之前）
 - **A13 背景窗口负样本日志监控** —— `RPNTrainer.reset_stats()` + `compute_loss` 统计 + 每 epoch 打印两个负样本来源。
 - **A10 窗口内 bbox 裁剪** —— `_get_bboxes_in_window` clip 到 [0,640]、<4px 丢弃；`sahi_inference` 扩张后 clip 回原图。
@@ -38,8 +48,9 @@
 
 ## 下一步
 1. 决定 dirty 提升方向（见上"未完成"第 1 条，建议先查标注一致性，成本最低）。
-2. 如继续训练：`python train.py --exp <name>`（改动已就位）。
-3. P2 收尾项见上。
+2. 多缺陷数据集到位后：Top-K 标定（`config.max_dets_per_image`）+ 按新数据重定评估口径（PR1 已把 NMS/窗口/截断三处修好）。
+3. 如继续训练：`python train.py --exp <name>`（改动已就位）。
+4. P2 收尾项见上。
 
 ## 风险（当前未解决）
 1. **dirty 偏移两极分化未解决**：非固定偏移，固定平移补偿无效（A14 已证伪）；部分 FN 是形状问题（框瘦高）而非平移。
