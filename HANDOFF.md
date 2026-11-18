@@ -5,6 +5,25 @@
 ## 当前阶段
 2026-09-27 夜间训练 `overnight_20260927`（20 epoch）已完成并出报告（TRAIN_REPORT.md + val_metrics.json，mAP@0.5=0.7788）。2026-09-29 完成 A14 dy 补偿实验（标定+诚实验证，结论：无净收益，保持默认关闭）。
 
+**2026-11-18 起新增 PCB 基准线（老师要求公开数据集可比性）**：PKU-Market-PCB-corrected（693 图 6 类，板级隔离划分 541/152），两条腿并行——PCB 管横向可比 + 模型迭代开发，瓶身管真实场景验证，互不混训。计划唯一来源 `docs/PCB_PLAN.md`。当前进度：Phase 0 完成（数据准备 + 锚框匹配率检查，决策 img_size=1024 + anchor=pcb_cand），下一步 Phase 1（config profile + dataset/model 适配 + 干净基线训练）。
+
+## 已完成（新增 2026-11-18）
+- **PCB 基准线 Phase 0**（详见 `docs/PCB_PLAN.md`）：
+  1. `tools/prepare_pcb.py`：从 `D:\百度网盘下载\PKU-Market-PCB-corrected` 的
+     ImageSets 板级划分生成 `data/pcb/pcb_split.json`（板 ID、每图实际尺寸、
+     归一化框、泄漏断言全过：文件名/板 ID 双不相交、693 图全覆盖）。
+  2. `tools/check_pcb_anchors.py`：全 train GT（2185 框）锚框匹配率 →
+     `data/pcb/anchor_match.json`。决策：**PCB anchor=pcb_cand**
+     （P2[16,24,32,48,64] P3[32,48,64,96,128] P4[64,96,128,192,256]，
+     ratio[0.5,1,2]），resize/sahi 两模式共用；基线输入=整图 letterbox 1024；
+     SAHI 消融列=640 原生窗。证据：resize_1024 cov>=0.3=1.000/cov>=0.5=0.981，
+     而 xinpaide 现役 anchor 在 resize_640 下仅 0.218（RPN 会饿死）。
+  3. 实测数据档案：每图 1~6 框均值 4.04（多实例）；sqrt(面积) 中位 64.9px
+     p10 43.4 / p90 87.9；面积占比中位 0.0686%；10 板=10 种图尺寸
+     → dataset 必须修 per-image 尺寸（现 `_get_bboxes_in_window` 用全局
+     4096×2736，PCB 下必错）。
+  4. 未碰任何现有代码/配置（xinpaide 口径不动）；脚本纯标准库 + `-I` 隔离运行。
+
 ## 已完成（新增 2026-10-19）
 - **多缺陷训练 PR3 v2**（交付包 `look-PR3-v2-适配最新提交-8bf0346`，opt-in，默认不影响旧训练口径）：
   1. `roi_training.py`：训练/验证 loss 专用 **GT proposal 注入 + GT 覆盖采样**——每个真实缺陷保证一个正例（防"极差 proposal 保底错标正类"）；**推理仍只用 RPN**。

@@ -2,7 +2,15 @@
 
 > 快速一览，细节见 HANDOFF.md。
 
-## 最新状态（2026-10-19）
+## 最新状态（2026-11-18）
+- **PCB 基准线 Phase 0 完成**（公开数据集可比性，两条腿并行；计划见 `docs/PCB_PLAN.md`）：
+  - 数据集：PKU-Market-PCB-corrected，板级隔离划分 train 541 / val 152，泄漏断言全过；
+    `data/pcb/pcb_split.json`（划分+每图尺寸+归一化框）已落盘。
+  - 锚框匹配率：resize_1024 + pcb_cand anchor cov>=0.3=1.000 / cov>=0.5=0.981；
+    xinpaide 现役 anchor 在 resize_640 下仅 0.218。决策：基线=整图 1024 + pcb_cand，
+    SAHI 消融列=640 原生窗（同 anchor 集）。
+  - 工具：`tools/prepare_pcb.py` / `tools/check_pcb_anchors.py`（纯标准库，`-I` 运行）。
+  - 下一步 Phase 1：config profile + dataset per-image 尺寸修复 + 干净基线训练 30 epoch。
 - **多缺陷训练 PR3 v2 已合入**（基于 8bf0346；opt-in，默认不影响旧训练口径）：
   - `roi_training.py`：GT proposal 注入 + GT 覆盖采样（仅训练/验证 loss，推理仍只用 RPN）；
     `manifest_training.py`：PR2 manifest → 训练数据（同图多实例、截断缺陷不误标背景、test_unseen_sku 禁入训练）。
