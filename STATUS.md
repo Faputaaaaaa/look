@@ -2,7 +2,14 @@
 
 > 快速一览，细节见 HANDOFF.md。
 
-## 最新状态（2026-11-18）
+## 最新状态（2026-11-19）
+- **PCB 基线 mAP50 = 0.3006 已出**（resize_1024 + pcb_cand anchor，30 epoch，val 152 图）：
+  - 每类 AP50：missing_hole 0.620 / open_circuit 0.457 / short 0.424 /
+    spurious_copper 0.192 / mouse_bite 0.086 / spur 0.025。
+  - 错检三信号：按类分化（非纯尺寸问题）、spur 外观混淆（276 FP 喷洒在
+    mouse_bite/spurious_copper 图）、按板分化（板 12 近乎全对、板 10 几乎全错——
+    板级泛化是真瓶颈）。详见 HANDOFF 与 `data/pcb/eval_resize.json`。
+  - 下一步 Phase 2 消融：SAHI 640 原生窗 / 解冻 backbone / 定向错检实验。
 - **PCB 基准线 Phase 1 代码适配完成，基线训练运行中**（详见 `docs/PCB_PLAN.md`）：
   - config `dataset_profile`（xinpaide 默认零改动）+ `train.py --dataset pcb`；dataset 修
     per-image 尺寸 + file_list 白名单 + 未知类警告；model_fpn `FPN_CONFIG_PCB`（15 anchor/层）

@@ -80,12 +80,47 @@ def invert_letterbox(box, scale, ox, oy, iw, ih):
     return (x1, y1, x2, y2)
 
 
+def _parse_out(out, thr):
+    """解析 model.inference 的输出（batch 第 0 张）。
+
+    与 sahi_inference._parse_inference_out 同逻辑，但该函数在 PR4 分支才存在
+    （exp/pcb-benchmark 从 main 开出），工具自持一份，避免跨分支依赖。
+    """
+    boxes_list = out.get("boxes", [])
+    scores_list = out.get("scores", [])
+    labels_list = out.get("labels", [])
+
+    if isinstance(boxes_list, list) and len(boxes_list) > 0:
+        b_boxes = boxes_list[0]
+        b_scores = scores_list[0] if isinstance(scores_list, list) else scores_list
+        b_labels = labels_list[0] if isinstance(labels_list, list) else labels_list
+    elif isinstance(boxes_list, torch.Tensor):
+        b_boxes = boxes_list[0] if boxes_list.dim() == 3 else boxes_list
+        b_scores = scores_list[0] if isinstance(scores_list, torch.Tensor) and scores_list.dim() >= 2 else scores_list
+        b_labels = labels_list[0] if isinstance(labels_list, torch.Tensor) and labels_list.dim() >= 2 else labels_list
+    else:
+        return []
+
+    results = []
+    if isinstance(b_boxes, torch.Tensor) and b_boxes.numel() > 0:
+        for i in range(b_boxes.size(0)):
+            s = float(b_scores[i].item()) if isinstance(b_scores, torch.Tensor) else float(b_scores)
+            if s < thr:
+                continue
+            c = int(b_labels[i].item()) if isinstance(b_labels, torch.Tensor) else int(b_labels)
+            if c == 0:
+                continue
+            box = b_boxes[i].cpu().numpy()
+            results.append((float(box[0]), float(box[1]), float(box[2]), float(box[3]), s, c))
+    return results
+
+
 @torch.no_grad()
 def infer_resize(model, img: Image.Image, thr):
     """resize 模式单图推理 → [(x1,y1,x2,y2,score,cls_name)] 原图坐标。"""
     t, scale, ox, oy = letterbox(img)
     out = model.inference(t)
-    dets = si._parse_inference_out(out, 0, thr)
+    dets = _parse_out(out, thr)
     iw, ih = img.size
     result = []
     for x1, y1, x2, y2, s, c in dets:
@@ -154,9 +189,10 @@ def bin_ap(manifest, pred_by_image, cls, lo, hi):
     if n_pos == 0:
         return None
     all_preds = sorted(
-        (d["confidence"], image_id, d["bbox"])
-        for image_id, dets in pred_by_image.items()
-        for d in dets if d["class_name"] == cls)
+        ((d["confidence"], image_id, d["bbox"])
+         for image_id, dets in pred_by_image.items()
+         for d in dets if d["class_name"] == cls),
+        key=lambda x: -x[0])  # 置信度降序（与 quality/metrics._match_class 同口径）
     matched = defaultdict(set)
     tps, fps = [], []
     for _conf, image_id, box in all_preds:

@@ -66,12 +66,18 @@
       INFERENCE_CONFIG_PCB（max_detections=20）+ RPN 公开 anchor_configs 属性
 - [x] `sahi_inference.py`：MODEL_CLS_TO_NAME 从 config.class_names 派生；
       扩张/dy 补偿加 `dataset_profile=='xinpaide'` 守卫
-- [ ] 基线训练：resize_1024、无 SAHI、无 GT-aware、负窗不限流、30 epoch
-      （运行中：`exp/pcb_baseline_resize1024`，日志 `exp_logs/pcb_baseline_resize1024.log`）
+- [x] 基线训练：resize_1024、无 SAHI、无 GT-aware、负窗不限流、30 epoch
+      （`exp/pcb_baseline_resize1024`；中途被系统内存强停一次，已 --resume 续训完成）
 - [x] `tools/evaluate_pcb.py`：推理 → predictions JSON → `quality/metrics.py`
       （per-class AP50 + micro P/R + 相对面积分档）
-- [ ] **错检分类表**：按 类 × 尺寸档 × 失败场景（贴边/重叠/低分背景窗）统计
-      FN/FP，导出可视化 crop——创新点的原材料
+- [x] **错检分类表**：基线 **mAP50 = 0.3006**（详见 HANDOFF/STATUS 与
+      `data/pcb/eval_resize.json`）。三类信号：① 按类分化的失败
+      （missing_hole 0.62 / open_circuit 0.46 / short 0.42 可用；
+      mouse_bite 0.09 / spurious_copper 0.19 / spur 0.02 崩溃）；
+      ② spur 大量 FP 喷洒在 mouse_bite/spurious_copper 图上（外观混淆）；
+      ③ 按板分化——板 12 上 missing_hole 98%/short 88%，板 10 上 short 0/25、
+      mouse_bite 1/26（板级泛化是真瓶颈，尺寸不是唯一瓶颈：
+      open_circuit tiny 档 AP 0.41）。图像级全检率仅 10.5%。
 - [ ] E05 分辨率对照：resize_640（pcb_cand）vs resize_1024，量化分辨率贡献
 
 ### Phase 2 — 消融与创新点（E06~E09）

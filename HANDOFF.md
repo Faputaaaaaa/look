@@ -5,7 +5,7 @@
 ## 当前阶段
 2026-09-27 夜间训练 `overnight_20260927`（20 epoch）已完成并出报告（TRAIN_REPORT.md + val_metrics.json，mAP@0.5=0.7788）。2026-09-29 完成 A14 dy 补偿实验（标定+诚实验证，结论：无净收益，保持默认关闭）。
 
-**2026-11-18 起新增 PCB 基准线（老师要求公开数据集可比性）**：PKU-Market-PCB-corrected（693 图 6 类，板级隔离划分 541/152），两条腿并行——PCB 管横向可比 + 模型迭代开发，瓶身管真实场景验证，互不混训。计划唯一来源 `docs/PCB_PLAN.md`。当前进度：Phase 0 完成、Phase 1 代码适配完成（回归全过）、**基线训练运行中**（pcb_baseline_resize1024，30 epoch）；训练完成后跑 `tools/evaluate_pcb.py` 出基线数字 + 错检分类表。
+**2026-11-18 起新增 PCB 基准线（老师要求公开数据集可比性）**：PKU-Market-PCB-corrected（693 图 6 类，板级隔离划分 541/152），两条腿并行——PCB 管横向可比 + 模型迭代开发，瓶身管真实场景验证，互不混训。计划唯一来源 `docs/PCB_PLAN.md`。当前进度：Phase 0/1 完成——**基线 mAP50 = 0.3006 已拿到**（resize_1024 + pcb_cand anchor，30 epoch），错检分类表已出（按类分化 + spur 外观混淆 + 按板分化三大信号）；下一步 Phase 2 消融（SAHI 640 原生窗 / 解冻 backbone / anchor 细化），创新点从错检分析定。
 
 ## 已完成（新增 2026-11-18）
 - **PCB 基准线 Phase 0**（详见 `docs/PCB_PLAN.md`）：
@@ -47,6 +47,26 @@
      --total-epochs 30`，日志 `exp_logs/pcb_baseline_resize1024.log`。
      完成后：`tools/evaluate_pcb.py --model experiments/pcb_baseline_resize1024/models/best_model.pth`
      → 错检分类表（Phase 1 收尾）。
+- **PCB 基线结果 + 错检分类表（2026-11-19，Phase 1 收尾）**：
+  1. 训练：30 epoch（中途被系统内存强停，`--resume latest.pth` 续训完成；
+     train loss 4.88→3.88，~253s/epoch）。best（epoch ~15，按 val loss 选）
+     与 latest 评估几乎一致（0.3006 vs 0.2969），模型已稳定。
+  2. **基线 mAP50 = 0.3006**（resize_1024，val 152 图，quality/metrics 口径）。
+     每类 AP50：missing_hole 0.620 / open_circuit 0.457 / short 0.424 /
+     spurious_copper 0.192 / mouse_bite 0.086 / spur 0.025。
+  3. **错检三大信号**（`data/pcb/eval_resize.json` 可复核）：
+     - **按类分化，不是纯尺寸问题**：open_circuit 的 tiny 档 AP=0.41、
+       missing_hole small 档 0.66 —— 小缺陷可学；失败集中在
+       mouse_bite / spur / spurious_copper 三类外观。
+     - **spur 外观混淆**：276 个 FP 喷洒在 mouse_bite(59) / spur 自身(95) /
+       spurious_copper(49) 图上；missing_hole 的 244 FP 均匀分布（通用误检）。
+     - **按板分化（板级泛化是真瓶颈）**：板 12 missing_hole 召回 98% /
+       short 88%；板 10 short 0/25、mouse_bite 1/26 —— 训练没见过板 10/11/12，
+       缺陷外观迁移因板而异（这正是板级隔离划分的意义：泄漏划分会虚高）。
+     - 图像级全检率 10.5%（多实例完整性差）；missing_hole/short 的 FN 集中在
+       medium 档（与板 10 高度相关，待 Phase 2 验证）。
+  4. 修复：`tools/evaluate_pcb.py` 分档 AP 排序笔误（升序→降序）已修；
+     `_parse_inference_out` 内联进工具（避免依赖 PR4 分支未合入代码）。
 
 ## 已完成（新增 2026-10-19）
 - **多缺陷训练 PR3 v2**（交付包 `look-PR3-v2-适配最新提交-8bf0346`，opt-in，默认不影响旧训练口径）：
@@ -104,9 +124,13 @@
 - **C4** GC10DET 残余隔离收尾（P2）。
 
 ## 下一步
-1. **等 PCB 基线训练完成**（b0jlzyeu2，日志 exp_logs/pcb_baseline_resize1024.log）：
-   `tools/evaluate_pcb.py --model experiments/pcb_baseline_resize1024/models/best_model.pth`
-   → 记 mAP50/per-class AP → 错检分类表（类 × 尺寸档 × 失败场景）→ 定创新点。
+1. **Phase 2 消融**（从错检信号出发，顺序按性价比）：
+   ① SAHI 640 原生窗训练（`--dataset pcb --img-size 640`，preprocess 改
+   sliding_window——Phase 2 需给 pcb profile 加该开关或走参数覆盖）；
+   ② 解冻 layer1/2 的微调对照（现 stage1/stage2 全程冻结，P2 特征来自冻结的
+   ImageNet 层，可能是小缺陷类的系统性瓶颈）；
+   ③ 针对 spur 混淆 / 板 10 泛化的定向实验（错检分析已给出靶子）。
+   每行独立重训 + `tools/evaluate_pcb.py` 评估，消融表见 docs/PCB_PLAN.md §5。
 2. 决定 dirty 提升方向（见上"未完成"第 1 条，建议先查标注一致性，成本最低）。
 3. 多缺陷数据集到位后：制作 manifest（按 `docs/PR2_DATA_EVAL.md` 合同）→ `tools.build_group_split` 分组划分 → 用 `train.py --manifest ... --split-json ... --data-root ...` 训练（自动 GT-aware）→ 训练后用 PR2 工具按新口径评估（multi_class_all_found_rate 等）。
 4. 如继续瓶身训练：`python train.py --exp <name>`（改动已就位）。
