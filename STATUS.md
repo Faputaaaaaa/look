@@ -3,6 +3,13 @@
 > 快速一览，细节见 HANDOFF.md。
 
 ## 最新状态（2026-11-18）
+- **PCB 基准线 Phase 1 代码适配完成，基线训练运行中**（详见 `docs/PCB_PLAN.md`）：
+  - config `dataset_profile`（xinpaide 默认零改动）+ `train.py --dataset pcb`；dataset 修
+    per-image 尺寸 + file_list 白名单 + 未知类警告；model_fpn `FPN_CONFIG_PCB`（15 anchor/层）
+    + `INFERENCE_CONFIG_PCB`；sahi 映射派生 + profile 守卫；`tools/evaluate_pcb.py` 就绪。
+  - 回归全过：单测 **55/55**（新增 test_pcb 6 项）、smoke_ui 5/5、
+    smoke_test IoU 0.742/0.825（与打补丁前一致）。
+  - 训练中：`pcb_baseline_resize1024`（resize 1024 + pcb_cand anchor，30 epoch，无 SAHI/GT-aware）。
 - **PCB 基准线 Phase 0 完成**（公开数据集可比性，两条腿并行；计划见 `docs/PCB_PLAN.md`）：
   - 数据集：PKU-Market-PCB-corrected，板级隔离划分 train 541 / val 152，泄漏断言全过；
     `data/pcb/pcb_split.json`（划分+每图尺寸+归一化框）已落盘。

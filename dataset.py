@@ -54,9 +54,10 @@ class DefectDataset(Dataset):
         label_format: str = None,
         max_samples_per_dir: int = None,
         from_end: bool = False,
+        file_list: Optional[List[str]] = None,
     ) -> None:
         """初始化数据集。
-        
+
         Args:
             img_dir: 图像目录（str或list[str]，支持多目录合并）
             label_dir: 标签目录（str或list[str]，与img_dir对应）
@@ -66,6 +67,8 @@ class DefectDataset(Dataset):
             label_format: 标签格式
             max_samples_per_dir: 每个目录最多加载的样本数（None表示全部）
             from_end: 是否从末尾开始取样本（用于验证集，避免与训练集重叠）
+            file_list: [PCB] 文件名白名单（basename，如 '10_mouse_bite_01.jpg'）；
+                None=目录全量。划分单一事实来源在 pcb_split.json，目录不编码划分。
         """
         # 支持单目录或多目录
         if isinstance(img_dir, (list, tuple)):
@@ -83,7 +86,8 @@ class DefectDataset(Dataset):
         self.label_format = label_format or config.label_format
         self.max_samples_per_dir = max_samples_per_dir
         self.from_end = from_end
-        
+        self.file_list = set(file_list) if file_list is not None else None
+
         # 从config获取参数
         self.img_size = config.img_size
         self.window_size = config.window_size
@@ -91,11 +95,20 @@ class DefectDataset(Dataset):
         self.crop_padding = config.crop_padding
         self.max_objects = config.max_objects
         self.class_name_map = config.class_name_map
-        
+
+        # [PCB] 类别映射跳过计数器（标注有框但全部不在 class_name_map 时警告，
+        # 防止映射错配静默丢框——xinpaide 7 类映射读 PCB 0..5 标签会吞掉 4 类）
+        self._skipped_unknown = 0
+
         # 加载数据
         self.samples = self._load_samples()
         self.filtered_count = 0
-        
+
+        if self._skipped_unknown > 0:
+            print(f"[Dataset] 警告: {self._skipped_unknown} 个标注框因类别不在 "
+                  f"class_name_map 被跳过；检查 config.dataset_profile / "
+                  f"yolo_id_to_name 是否与数据集匹配")
+
         print(f"[Dataset] 加载了 {len(self.samples)} 个样本，模式: {self.mode}，方法: {self.preprocess_method}，格式: {self.label_format}")
     
     def _load_samples(self) -> List[Dict]:
@@ -109,7 +122,11 @@ class DefectDataset(Dataset):
         for dir_idx, (img_dir, label_dir) in enumerate(zip(self.img_dirs, self.label_dirs)):
             # 获取所有图片并排序（确保可复现）
             img_files = sorted(list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png")))
-            
+
+            # [PCB] 文件名白名单过滤（划分由 pcb_split.json 决定，目录不编码划分）
+            if self.file_list is not None:
+                img_files = [f for f in img_files if f.name in self.file_list]
+
             # 限制每个目录的样本数
             if self.max_samples_per_dir is not None:
                 if self.from_end:
@@ -157,12 +174,14 @@ class DefectDataset(Dataset):
                     # [R35] SAHI滑动窗口：含缺陷窗口全保留 + 背景窗口限量
                     # 原图4096×2736，1024切片+stride512产生~35窗口/图
                     # 但每图仅1个缺陷，含缺陷窗口约2-4个，其余为纯背景
-                    # 背景>缺陷会淹没RPN正样本，故每图限量2个背景窗口
-                    windows = self._generate_windows(img_file)
+                    # 背景>缺陷会淹没RPN正样本，故每图限量（config.max_neg_windows_per_img）
+                    # [PCB] 窗口内 bbox 裁剪按每图实际尺寸（PCB 有 10 种板尺寸，
+                    # 不能用全局 config.original_img_*）
+                    windows, (img_w, img_h) = self._generate_windows(img_file)
                     pos_window_samples = []
                     neg_window_samples = []
                     for window in windows:
-                        window_bboxes = self._get_bboxes_in_window(bboxes, window)
+                        window_bboxes = self._get_bboxes_in_window(bboxes, window, img_w, img_h)
                         sample_item = {
                             'img_path': str(img_file),
                             'label_path': str(label_file),
@@ -175,10 +194,10 @@ class DefectDataset(Dataset):
                             neg_window_samples.append(sample_item)
                     # 含缺陷窗口全保留
                     samples.extend(pos_window_samples)
-                    # 背景窗口限量：每图最多2个（随机采样）
-                    max_neg_per_img = 2
-                    if len(neg_window_samples) > max_neg_per_img:
-                        neg_window_samples = random.sample(neg_window_samples, max_neg_per_img)
+                    # 背景窗口限量（[PCB] 配置化：None=不限；xinpaide 默认 2）
+                    max_neg = config.max_neg_windows_per_img
+                    if max_neg is not None and len(neg_window_samples) > max_neg:
+                        neg_window_samples = random.sample(neg_window_samples, max_neg)
                     samples.extend(neg_window_samples)
                 
                 else:  # resize
@@ -221,6 +240,7 @@ class DefectDataset(Dataset):
                 if name in self.class_name_map:
                     class_id = self.class_name_map[name]
                 else:
+                    self._skipped_unknown += 1  # [PCB] 跳过计数（init 时汇总警告）
                     continue  # 跳过不在目标类别中的缺陷
                 
                 # 边界框
@@ -286,6 +306,9 @@ class DefectDataset(Dataset):
                             if class_name and class_name in self.class_name_map:
                                 model_class_id = self.class_name_map[class_name]
                             else:
+                                # [PCB] 跳过计数：映射错配（如 xinpaide 7 类映射
+                                # 读 PCB 0..5 标签）会静默吞框，现在汇总警告
+                                self._skipped_unknown += 1
                                 continue  # 跳过不在目标类别中的缺陷
 
                             bboxes.append({
@@ -300,8 +323,14 @@ class DefectDataset(Dataset):
 
         return bboxes
     
-    def _generate_windows(self, img_path: Path) -> List[Dict]:
-        """生成滑动窗口位置。"""
+    def _generate_windows(self, img_path: Path) -> Tuple[List[Dict], Tuple[int, int]]:
+        """生成滑动窗口位置。
+
+        Returns:
+            (windows, (img_w, img_h)): 窗口列表 + 图像实际尺寸。
+            [PCB] 实际尺寸随窗口一起返回：10 种板尺寸的图混在一个数据集里，
+            bbox 裁剪必须用每图尺寸，不能用全局 config.original_img_*。
+        """
         try:
             img = Image.open(img_path)
             img_w, img_h = img.size
@@ -324,24 +353,26 @@ class DefectDataset(Dataset):
             x = img_w - self.window_size
             for y in range(0, img_h - self.window_size + 1, self.window_stride):
                 windows.append({'x': x, 'y': y, 'w': self.window_size, 'h': self.window_size})
-        
+
         if img_h > self.window_size:
             y = img_h - self.window_size
             for x in range(0, img_w - self.window_size + 1, self.window_stride):
                 windows.append({'x': x, 'y': y, 'w': self.window_size, 'h': self.window_size})
-        
-        return windows
-    
-    def _get_bboxes_in_window(self, bboxes: List[Dict], window: Dict) -> List[Dict]:
+
+        return windows, (img_w, img_h)
+
+    def _get_bboxes_in_window(self, bboxes: List[Dict], window: Dict,
+                              img_w: int, img_h: int) -> List[Dict]:
         """获取窗口内的边界框，并把 GT clip 到窗口边界 [0, window_size]。
 
         [A10] 修复：之前只判断缺陷中心在窗口内，但记录完整宽高不 clip，
         导致贴边缺陷的 GT 越界（x1<0 / w>1）。现在：
         1. 把 GT 在窗口像素坐标下 clip 到 [0, window_w]×[0, window_h]。
         2. clip 后宽或高 < 4px 的 GT 丢弃（模型输入 640 空间下 4px 已不可学）。
+
+        [PCB] img_w/img_h 改为入参：xinpaide 全部图 4096×2736 所以以前
+        可以用全局常量；PCB 10 种板尺寸混在一起，必须按每图实际尺寸换算。
         """
-        img_w = config.original_img_width
-        img_h = config.original_img_height
         win_w = window['w']
         win_h = window['h']
         MIN_PX = 4  # clip 后最小尺寸阈值（窗口像素 = 模型输入像素）
@@ -608,14 +639,17 @@ class DefectDataset(Dataset):
         # 4. 数据增强（在letterbox后的正方形图上操作）
         if self.mode == 'train' and config.use_augmentation:
             # 4.0 马赛克增强 [Round14] — 以p=0.5概率将4张图拼接为1张
-            if random.random() < 0.5:
+            # [PCB] config.use_mosaic 默认 False：违反项目「只保留水平翻转」规则，
+            # 代码路径保留（死路径标记），PCB/xinpaide 默认都不走。
+            if config.use_mosaic and random.random() < 0.5:
                 img_resized, bboxes = self._mosaic_augment(img, img_w, img_h)
                 num_objects = len(bboxes)
 
             # 4.0.5 [R22] RandomCrop — 打破空间偏置（特别是Y轴坍缩）
             # 以p=0.35概率随机裁剪70%-100%区域，再缩放回原尺寸
             # 这迫使模型学习位置不变的特征，而非记忆固定空间模式
-            if random.random() < 0.35 and len(bboxes) > 0:
+            # [PCB] config.use_random_crop_aug 默认 False（同上，死路径保留）
+            if config.use_random_crop_aug and random.random() < 0.35 and len(bboxes) > 0:
                 crop_ratio = random.uniform(0.7, 1.0)
                 crop_w = int(self.img_size * crop_ratio)
                 crop_h = int(self.img_size * crop_ratio)
@@ -849,9 +883,10 @@ def create_dataloader(
     label_format: str = None,
     max_samples_per_dir: int = None,
     from_end: bool = False,
+    file_list: Optional[List[str]] = None,
 ) -> torch.utils.data.DataLoader:
     """创建数据加载器。
-    
+
     Args:
         img_dir: 图像目录（str或list[str]）
         label_dir: 标签目录（str或list[str]）
@@ -862,7 +897,8 @@ def create_dataloader(
         label_format: 标签格式
         max_samples_per_dir: 每个目录最多加载样本数
         from_end: 是否从末尾取样本
-    
+        file_list: [PCB] 文件名白名单（划分由 pcb_split.json 决定）
+
     Returns:
         DataLoader: 数据加载器
     """
@@ -912,6 +948,7 @@ def create_dataloader(
         label_format=label_format,
         max_samples_per_dir=max_samples_per_dir,
         from_end=from_end,
+        file_list=file_list,
     )
     
     dataloader = torch.utils.data.DataLoader(

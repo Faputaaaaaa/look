@@ -30,7 +30,7 @@ from config import config
 from model_fpn import (
     TwoStageDetector,
     CIoULoss,
-    FPN_CONFIG,  # [Round15] 导入FPN配置(用于动态anchor数)
+    get_active_fpn_config,        # [PCB] 按 profile 返回 FPN 配置（含锚框）
     INFERENCE_CONFIG,
     extract_rpn_proposals,       # [P0.5] 统一 proposal 提取
     assign_levels_and_roi_align,  # [P0.5] 统一 FPN 层分配 + roi_align
@@ -549,7 +549,7 @@ class RPNTrainer:
     """
     
     def __init__(self):
-        cfg = FPN_CONFIG['rpn_config']
+        cfg = get_active_fpn_config()['rpn_config']  # [PCB] 按 profile 选 rpn_config
         self.pos_iou_thresh = cfg['pos_iou_thresh']
         self.neg_iou_thresh = cfg['neg_iou_thresh']
         self.pos_neg_ratio = cfg['pos_neg_ratio']
@@ -766,7 +766,7 @@ def train_one_epoch(model, train_loader, optimizer, rpn_trainer, device, img_siz
             # RPN loss：对每层切片计算正负样本损失（[R26] permute 对齐 anchor）
             for i, layer_name in enumerate(['P2', 'P3', 'P4']):
                 anchors = anchors_dict[layer_name]
-                _lc = FPN_CONFIG['anchor_configs'][layer_name]
+                _lc = model.rpn.anchor_configs[layer_name]  # [PCB] 锚框配置从模型实例读
                 num_anchors_actual = len(_lc['scales']) * len(_lc['ratios'])
                 max_a = model.rpn.max_anchors_per_loc
 
@@ -1004,7 +1004,7 @@ def validate(model, val_loader, rpn_trainer, device, img_size):
                 # RPN loss：对每层切片计算（背景窗口也参与，与 train 一致）
                 for i, layer_name in enumerate(['P2', 'P3', 'P4']):
                     anchors = anchors_dict[layer_name]
-                    _lc2 = FPN_CONFIG['anchor_configs'][layer_name]
+                    _lc2 = model.rpn.anchor_configs[layer_name]  # [PCB] 锚框配置从模型实例读
                     num_anchors_actual = len(_lc2['scales']) * len(_lc2['ratios'])
                     max_a = model.rpn.max_anchors_per_loc
 
@@ -1378,6 +1378,11 @@ def parse_args():
                         help='manifest 图片相对路径的根目录')
     parser.add_argument('--gt-aware-roi', action='store_true',
                         help='启用 GT proposal 正例覆盖采样；多缺陷 manifest 模式自动启用')
+    # [PCB] 数据集 profile 切换（见 config.set_profile / docs/PCB_PLAN.md）
+    parser.add_argument('--dataset', type=str, default=None, choices=['xinpaide', 'pcb'],
+                        help='数据集 profile（默认 xinpaide；pcb=公开基准线，板级划分）')
+    parser.add_argument('--img-size', type=int, default=None,
+                        help='覆盖 config.img_size（如 PCB SAHI 消融训练时用 640）')
     return parser.parse_args()
 
 
@@ -1392,6 +1397,16 @@ def main():
         raise ValueError('manifest 模式禁止从旧优化器 --resume；请另行实现显式 --init-weights 微调')
     if args.manifest or args.gt_aware_roi:
         config.use_gt_aware_roi_training = True
+    if args.manifest and args.dataset:
+        raise ValueError('--manifest 与 --dataset 互斥（manifest 自带数据来源）')
+    if args.dataset:
+        # [PCB] 必须在构建数据集/模型之前切 profile（锚框/类别/尺寸都从 config 派生）
+        config.set_profile(args.dataset)
+        print(f"[PCB] dataset_profile = {config.dataset_profile} "
+              f"(类别 {len(config.class_names)}，img_size {config.img_size})")
+    if args.img_size:
+        config.img_size = args.img_size
+        print(f"[Config] img_size 覆盖为 {config.img_size}")
     if args.exp:
         # 覆盖实验名，并重新推导派生路径（__post_init__ 已在 import 时跑过）
         config.experiment_name = args.exp
@@ -1415,7 +1430,7 @@ def main():
     print(f"  AMP混合精度: {'启用' if config.use_amp else '关闭'}")
     print(f"  学习率预热: {config.warmup_epochs} 轮")
     print("\n[FPN配置]")
-    for layer, cfg in FPN_CONFIG['anchor_configs'].items():
+    for layer, cfg in get_active_fpn_config()['anchor_configs'].items():
         num_anchors = len(cfg['scales']) * len(cfg['ratios'])
         print(f"  {layer}: stride={cfg['stride']}, anchors/位置={num_anchors}")
     print("\n[损失函数（已统一）]")
@@ -1436,6 +1451,25 @@ def main():
             args.manifest, args.split_json, args.data_root
         )
         print('[PR3] 多缺陷 manifest 训练：使用 PR2 分组划分，GT-aware ROI 已开启')
+    elif config.dataset_profile == 'pcb':
+        # [PCB] 板级划分 541/152：划分单一事实来源在 pcb_split.json（tools/prepare_pcb.py 生成）。
+        # 目录不编码划分，靠 file_list 白名单加载；禁止按切片/按图随机分（防板级泄漏）。
+        import json as _json
+        split_path = Path(config.pcb_split_json)
+        if not split_path.exists():
+            raise FileNotFoundError(
+                f"找不到 {split_path}，先运行 tools/prepare_pcb.py 生成")
+        pcb_split = _json.loads(split_path.read_text(encoding="utf-8"))
+        train_files = [r["file"] for r in pcb_split["train"]]
+        val_files = [r["file"] for r in pcb_split["val"]]
+        assert set(train_files) & set(val_files) == set(), "pcb_split 泄漏：train/val 文件名重叠"
+        train_loader = create_dataloader(
+            config.train_img_dirs, config.train_label_dirs,
+            mode='train', file_list=train_files)
+        val_loader = create_dataloader(
+            config.val_img_dirs, config.val_label_dirs,
+            mode='val', file_list=val_files)
+        print(f"[PCB] 板级划分加载：train={len(train_files)} / val={len(val_files)}")
     else:
         # [R24] xinpaide：合并dirty+missing，按8:2划分
         # 训练集：每子集前80张，验证集：每子集后20张（无重叠）

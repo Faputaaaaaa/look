@@ -59,15 +59,16 @@
 - [x] 协议冻结：板级划分 541/152、mAP50 主指标、seed=42、评估只用 val 板
 
 ### Phase 1 — 干净基线 + 错检分析（E02/E03/E04/E05）
-- [ ] config 加 `dataset_profile`（默认 xinpaide 不变）+ `train.py --dataset pcb`
-- [ ] `dataset.py`：修 per-image 尺寸（`_get_bboxes_in_window` 改用实际图尺寸）、
+- [x] config 加 `dataset_profile`（默认 xinpaide 不变）+ `train.py --dataset pcb`
+- [x] `dataset.py`：修 per-image 尺寸（`_get_bboxes_in_window` 改用实际图尺寸）、
       file-list 加载（读 pcb_split.json）、负窗限流配置化、未知类跳过加警告
-- [ ] `model_fpn.py`：FPN_CONFIG_PCB + `get_active_fpn_config()`（6 处引用切换）
-- [ ] `sahi_inference.py`：MODEL_CLS_TO_NAME 从 config.class_names 派生；
+- [x] `model_fpn.py`：FPN_CONFIG_PCB + `get_active_fpn_config()`（6 处引用切换）；
+      INFERENCE_CONFIG_PCB（max_detections=20）+ RPN 公开 anchor_configs 属性
+- [x] `sahi_inference.py`：MODEL_CLS_TO_NAME 从 config.class_names 派生；
       扩张/dy 补偿加 `dataset_profile=='xinpaide'` 守卫
-      （注意：叠在 PR4 未提交改动之上）
 - [ ] 基线训练：resize_1024、无 SAHI、无 GT-aware、负窗不限流、30 epoch
-- [ ] `tools/evaluate_pcb.py`：推理 → predictions JSON → `quality/metrics.py`
+      （运行中：`exp/pcb_baseline_resize1024`，日志 `exp_logs/pcb_baseline_resize1024.log`）
+- [x] `tools/evaluate_pcb.py`：推理 → predictions JSON → `quality/metrics.py`
       （per-class AP50 + micro P/R + 相对面积分档）
 - [ ] **错检分类表**：按 类 × 尺寸档 × 失败场景（贴边/重叠/低分背景窗）统计
       FN/FP，导出可视化 crop——创新点的原材料

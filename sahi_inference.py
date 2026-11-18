@@ -41,8 +41,10 @@ SPLIT_PATH = Path(__file__).resolve().parent / "split.json"  # 按原图划分�
 SUBSETS = ['dirty', 'missing']
 # [A9] 从 config 派生目标类 GT id → name 映射（单一事实来源）
 YOLO_ID_TO_NAME = {yid: name for yid, name in config.yolo_id_to_name.items() if name in config.class_names}
-# 模型输出: 0=BG, 1=missing, 2=dirty
-MODEL_CLS_TO_NAME = {1: 'missing', 2: 'dirty'}
+# 模型输出: 0=BG, 1..N=前景。
+# [PCB] 从 config.class_names 派生（xinpaide 下 {1:'missing',2:'dirty'} 与历史一致；
+# PCB profile 下为 6 类）。注意 import 顺序：PCB 工具须先 config.set_profile('pcb')。
+MODEL_CLS_TO_NAME = {i + 1: name for i, name in enumerate(config.class_names)}
 
 WINDOW = config.window_size   # 640
 STRIDE = config.window_stride # 320
@@ -225,7 +227,10 @@ def sahi_inference_image(model, img, score_thresh=None, max_dets=None, progress=
     # overnight_20260927 后 dirty 框系统性向下偏移（train/val 均 100% 为正），
     # 宽高正常，纯平移偏差，故整体上移 dy_comp_dirty 像素。
     # 越界 clip 由下方扩张段的边界裁剪统一处理。
-    if config.use_dy_compensation and config.dy_comp_dirty != 0.0:
+    # [PCB] 守卫：class_id==2 是 xinpaide 的 dirty 语义，PCB profile 下禁用
+    #（PCB 的 id 2 是 open_circuit，平移补偿无意义）。
+    if (config.use_dy_compensation and config.dy_comp_dirty != 0.0
+            and config.dataset_profile == 'xinpaide'):
         shifted = []
         for x1, y1, x2, y2, s, c in final:
             if c == 2:  # dirty
@@ -240,13 +245,15 @@ def sahi_inference_image(model, img, score_thresh=None, max_dets=None, progress=
     # [A11] 扩张后处理：系数从 config 读，开关 config.use_bbox_expansion（默认关闭）。
     # 历史 R40/R41 用 1.3x/1.1x 补偿框偏小，但 B1 诊断发现 R41 已不再偏小 50%，
     # 扩张过度补偿，故默认关闭；重新训练后按新数据统计再决定是否启用。代码路径保留。
+    # [PCB] 守卫：class_id 1/2 是 xinpaide 的 missing/dirty 语义，
+    # PCB profile 下禁用（PCB 的 1/2 是 mouse_bite/open_circuit）。
     expanded = []
     for x1, y1, x2, y2, s, c in final:
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
         w = x2 - x1
         h = y2 - y1
-        if config.use_bbox_expansion:
+        if config.use_bbox_expansion and config.dataset_profile == 'xinpaide':
             if c == 1:
                 w *= config.expand_missing
                 h *= config.expand_missing

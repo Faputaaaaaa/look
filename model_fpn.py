@@ -193,10 +193,12 @@ class AnchorGenerator:
     """
     
     def __init__(self):
-        # [修正C] 从FPN_CONFIG读取锚框配置，单一事实来源
-        # 如果FPN_CONFIG尚未定义（极端情况），使用内置默认值
+        # [修正C] 从 get_active_fpn_config() 读取锚框配置，单一事实来源。
+        # [PCB] xinpaide/pcb 两套锚框按 config.dataset_profile 选择
+        # （FPN_CONFIG / FPN_CONFIG_PCB，见文件底部）。
+        # 如果尚未定义（极端情况），使用内置默认值
         try:
-            _cfg = FPN_CONFIG.get('anchor_configs', {})
+            _cfg = get_active_fpn_config().get('anchor_configs', {})
             self.anchor_configs = {
                 'P2': {'stride': _cfg.get('P2', {}).get('stride', 4),
                        'scales': _cfg.get('P2', {}).get('scales', [8,12,16,24,32]),
@@ -209,7 +211,7 @@ class AnchorGenerator:
                        'ratios': _cfg.get('P4', {}).get('ratios', [0.3,0.5,1.0,2.0,3.0])},
             }
         except NameError:
-            # FPN_CONFIG未定义时的回退（仅用于测试等边缘场景）
+            # get_active_fpn_config 未定义时的回退（仅用于测试等边缘场景）
             self.anchor_configs = {
                 'P2': {'stride': 4, 'scales': [8,12,16,24,32], 'ratios': [0.3,0.5,1.0,2.0,3.0]},
                 'P3': {'stride': 8, 'scales': [8,12,16,24,32], 'ratios': [0.3,0.5,1.0,2.0,3.0]},
@@ -312,16 +314,20 @@ class RPN(nn.Module):
         self.conv = nn.Conv2d(in_channels, in_channels, 3, padding=1)
 
         # [Round15] 动态锚框数: 取所有层中最大值
-        # P2=25, P3=40, P4=63 → RPN head输出63通道(每层reshape时取前N个)
+        # [PCB] 从 get_active_fpn_config() 读（xinpaide=20, pcb=15）
         self.max_anchors_per_loc = max(
             len(cfg['scales']) * len(cfg['ratios'])
-            for cfg in FPN_CONFIG['anchor_configs'].values()
-        )  # = 63 (from P4: 9ratios × 7scales)
+            for cfg in get_active_fpn_config()['anchor_configs'].values()
+        )
         self.cls_conv = nn.Conv2d(in_channels, self.max_anchors_per_loc, 1)
         self.bbox_conv = nn.Conv2d(in_channels, self.max_anchors_per_loc * 4, 1)
 
         # 锚框生成器
         self.anchor_generator = AnchorGenerator()
+        # [PCB] 把锚框配置暴露为 RPN 的公开属性：extract_rpn_proposals /
+        # train.py 的 RPN loss 切片都从 model.rpn.anchor_configs 读，
+        # 保证「模型实例即配置来源」（profile 切换时跟随模型走）。
+        self.anchor_configs = self.anchor_generator.anchor_configs
     
     def forward(
         self, 
@@ -788,9 +794,11 @@ class TwoStageDetector(nn.Module):
 
             # Step 4: category-aware NMS; overlapping different classes survive.
             # This is multi-instance detection, not multi-label prediction for one ROI.
+            # [PCB] nms_thresh/max_detections 按 profile 取（PCB 多实例需 ≥20）
+            _ic = get_active_inference_config()
             keep = class_aware_keep(
                 final_boxes, final_scores, final_labels,
-                INFERENCE_CONFIG['nms_thresh'], INFERENCE_CONFIG['max_detections'])
+                _ic['nms_thresh'], _ic['max_detections'])
 
             all_boxes.append(final_boxes[keep])
             all_scores.append(final_scores[keep])
@@ -837,7 +845,9 @@ def extract_rpn_proposals(model, rpn_cls_preds, rpn_bbox_preds, fpn_features,
     proposal_scores = []
     for i, layer_name in enumerate(_RPN_LAYERS):
         anchors = anchors_dict[layer_name]
-        _lc = FPN_CONFIG['anchor_configs'][layer_name]
+        # [PCB] 锚框配置从模型实例读（RPN 构建时已按 profile 选好），
+        # 不再引用模块级 FPN_CONFIG —— train/val/inference 三处共用同一模型配置。
+        _lc = model.rpn.anchor_configs[layer_name]
         num_anchors_actual = len(_lc['scales']) * len(_lc['ratios'])
         max_a = model.rpn.max_anchors_per_loc
 
@@ -978,6 +988,56 @@ INFERENCE_CONFIG = {
     'nms_thresh': 0.30,            # 收紧NMS，合并更多重叠框
     'max_detections': 5,           # 每张切片最多5个检测（原图每张仅1个缺陷）
 }
+
+# [PCB] PCB 基准线配置（docs/PCB_PLAN.md + data/pcb/anchor_match.json 的决策）。
+# 锚框决策：train GT（2185 框，sqrt(面积) 中位 64.9px）在 resize_1024 下
+# pcb_cand 匹配率 cov>=0.3=1.000 / cov>=0.5=0.981；SAHI 640 原生窗 cov>=0.5=0.997。
+# 两种模式共用同一套锚框，消融只变「输入模式」一个变量。
+FPN_CONFIG_PCB = {
+    'fpn_layers': ['P2', 'P3', 'P4'],
+    'fpn_channels': 256,
+
+    # 覆盖输入空间 16~256px；resize_1024 下 GT 像素中位 23.4px（p10 15.4 / p90 31.7），
+    # SAHI 640 原生窗下 GT 保持 43~88px —— 两者都被 P2/P3 尺度段覆盖。
+    'anchor_configs': {
+        'P2': {'stride': 4, 'scales': [16, 24, 32, 48, 64],      'ratios': [0.5, 1.0, 2.0]},
+        'P3': {'stride': 8, 'scales': [32, 48, 64, 96, 128],     'ratios': [0.5, 1.0, 2.0]},
+        'P4': {'stride': 16, 'scales': [64, 96, 128, 192, 256],  'ratios': [0.5, 1.0, 2.0]},
+    },
+
+    # rpn_config 与 xinpaide 基线同值：pos 0.3 / neg 0.1 / pos:neg 1:3。
+    # max_neg_per_bg_window 只作用于背景窗口（PCB 全图 resize 模式每图都有 GT，不触发）。
+    'rpn_config': {
+        'pos_iou_thresh': 0.3,
+        'neg_iou_thresh': 0.1,
+        'pos_neg_ratio': 3,
+        'max_neg_per_bg_window': 64,
+        'nms_thresh': 0.5,
+        'pre_nms_top_n': 200,
+        'post_nms_top_n': 300,
+    },
+
+    'loss_config': {
+        'rpn_focal_alpha': 0.25,
+        'rpn_focal_gamma': 2.0,
+        'roi_focal_alpha': 0.5,
+        'roi_focal_gamma': 2.0,
+    }
+}
+
+# [PCB] 每图 3~5 框（多实例），max_detections=5 的全类合计截断会砍掉真阳性 → 20
+INFERENCE_CONFIG_PCB = dict(INFERENCE_CONFIG)
+INFERENCE_CONFIG_PCB['max_detections'] = 20
+
+
+def get_active_fpn_config():
+    """[PCB] 按 config.dataset_profile 返回生效的 FPN 配置（单一事实来源）。"""
+    return FPN_CONFIG_PCB if config.dataset_profile == 'pcb' else FPN_CONFIG
+
+
+def get_active_inference_config():
+    """[PCB] 按 config.dataset_profile 返回生效的推理配置。"""
+    return INFERENCE_CONFIG_PCB if config.dataset_profile == 'pcb' else INFERENCE_CONFIG
 
 
 if __name__ == "__main__":

@@ -57,6 +57,11 @@ class Config:
     
     # 随机种子（确保结果可复现）
     seed: int = 42
+
+    # [PCB] 数据集 profile：xinpaide（默认，瓶身线，行为不变）/ pcb（公开基准线）
+    # 切换方式：train.py --dataset pcb；或代码里 config.set_profile('pcb')。
+    # 注意：切换是单向的（进程启动时设置），pcb 分支会覆盖数据集派生字段。
+    dataset_profile: str = "xinpaide"
     
     # ============================================================
     # 滑动窗口参数 - 根据你的数据集分析结果设置
@@ -110,6 +115,18 @@ class Config:
 
     # 最大目标数量
     max_objects: int = 10  # xinpaide每张图只有1个缺陷，10足够
+
+    # [PCB] 滑动窗口模式下每张原图保留的背景窗口数（None=不限）。
+    # xinpaide 历史硬编码 2（dataset.py），现配置化；PCB 干净基线= None（不限）。
+    max_neg_windows_per_img: Optional[int] = 2
+
+    # [PCB] resize 路径的增强开关（默认关；xinpaide 走滑动窗口路径不经过）。
+    # mosaic/RandomCrop 违反项目「只保留水平翻转」规则，代码路径保留但默认禁用。
+    use_mosaic: bool = False
+    use_random_crop_aug: bool = False
+
+    # [PCB] 板级划分文件（tools/prepare_pcb.py 生成，训练/评估的 file_list 来源）
+    pcb_split_json: str = ""
 
     # [PR3 / experimental] 训练与验证 loss 使用 GT proposal + GT 覆盖采样。
     # 默认 False 保持 2026-09-27 模型及其 loss 的旧实验口径；切换后需要重训。
@@ -199,23 +216,84 @@ class Config:
     
     def __post_init__(self):
         """初始化后处理。"""
+        # [PCB] 先按 profile 设置数据集派生字段（xinpaide 分支保持历史行为）
+        self._apply_dataset_profile()
+
         # 自动生成实验名称
         if not self.experiment_name:
             self.experiment_name = datetime.now().strftime("exp_%Y%m%d_%H%M%S")
-        
+
         # 计算滑动窗口重叠率
         self.window_overlap = 1 - self.window_stride / self.window_size
-        
+
         # 设置路径
         base_dir = Path("experiments") / self.experiment_name
-        
+
         if not self.model_save_path:
             self.model_save_path = str(base_dir / "models" / "best_model.pth")
-        
+
         if not self.log_dir:
             self.log_dir = str(base_dir / "logs")
-        
-        # 设置数据集子目录（xinpaide结构）
+
+    def set_profile(self, profile: str) -> None:
+        """[PCB] 运行时切换数据集 profile（train.py --dataset / 评估工具用）。
+
+        单向切换：pcb 分支会覆盖数据集派生字段；切回 xinpaide 不自动恢复
+        （进程内来回切换不支持，需要时直接改字段）。
+        """
+        if profile not in ("xinpaide", "pcb"):
+            raise ValueError(f"未知 dataset_profile: {profile}")
+        self.dataset_profile = profile
+        self._apply_dataset_profile()
+
+    def _apply_dataset_profile(self) -> None:
+        """[PCB] 按 dataset_profile 设置数据集派生字段。xinpaide 分支 = 历史行为。
+
+        xinpaide 分支不重置字段默认值（保持「直接改 config.py 参数」的工作流）；
+        pcb 分支显式覆盖全部数据集相关字段。
+        """
+        if self.dataset_profile == "pcb":
+            # ---- PCB 公开基准线（PKU-Market-PCB-corrected） ----
+            # 类映射：YOLO id 0..5 = 模型 class_id 0..5 直通，
+            # 与 xinpaide 的 7 类映射（missing=3/dirty=4）完全隔离。
+            # 锚框集在 model_fpn.FPN_CONFIG_PCB（匹配率检查决策，见 docs/PCB_PLAN.md）。
+            self.data_dir = r"D:\百度网盘下载\PKU-Market-PCB-corrected"
+            self.label_format = "yolo"
+            self.class_names = [
+                'missing_hole', 'mouse_bite', 'open_circuit',
+                'short', 'spur', 'spurious_copper'
+            ]
+            self.class_name_map = {n: i for i, n in enumerate(self.class_names)}
+            self.yolo_id_to_name = {i: n for i, n in enumerate(self.class_names)}
+            self.pcb_split_json = str(
+                Path(__file__).resolve().parent / "data" / "pcb" / "pcb_split.json")
+            # 每图 1~6 框（实测均值 4.04），16 留余量（超了 dataset 会 raise 不静默丢）
+            self.max_objects = 16
+            self.max_dets_per_image = 20   # 多实例评估不能 top-1 截断
+            # 基线：整图 letterbox 1024（匹配率 cov>=0.3=1.000，见 anchor_match.json）
+            self.img_size = 1024
+            self.preprocess_method = "resize"
+            # SAHI 消融列：640 原生窗（Phase 2 训练时 --img-size 640）
+            self.window_size = 640
+            self.window_stride = 320
+            # 兜底尺寸（dataset 已按每图实际尺寸读；10 板尺寸各不相同）
+            self.original_img_width = 3056
+            self.original_img_height = 2464
+            self.max_neg_windows_per_img = None  # 干净基线不限背景窗
+            self.use_mosaic = False
+            self.use_random_crop_aug = False
+            # 训练/验证用同一组目录，划分靠 file_list（板级隔离，防泄漏）
+            self.train_img_dirs = [str(Path(self.data_dir) / "images")]
+            self.train_label_dirs = [str(Path(self.data_dir) / "labels")]
+            self.val_img_dirs = self.train_img_dirs
+            self.val_label_dirs = self.train_label_dirs
+            self.test_img_dirs = self.train_img_dirs
+            self.test_label_dirs = self.train_label_dirs
+            self.train_samples_per_subset = None  # 不取前 N 张；由 split JSON 定
+            self.val_samples_per_subset = None
+            return
+
+        # ---- xinpaide（默认）：历史逻辑原样（含 GC10DET VOC 残余路径） ----
         if self.label_format == "yolo":
             # [R24] 合并dirty和missing两个子集，按8:2划分训练/验证
             # 训练集：dirty前80张 + missing前80张 = 160张

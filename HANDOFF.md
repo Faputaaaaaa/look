@@ -5,7 +5,7 @@
 ## 当前阶段
 2026-09-27 夜间训练 `overnight_20260927`（20 epoch）已完成并出报告（TRAIN_REPORT.md + val_metrics.json，mAP@0.5=0.7788）。2026-09-29 完成 A14 dy 补偿实验（标定+诚实验证，结论：无净收益，保持默认关闭）。
 
-**2026-11-18 起新增 PCB 基准线（老师要求公开数据集可比性）**：PKU-Market-PCB-corrected（693 图 6 类，板级隔离划分 541/152），两条腿并行——PCB 管横向可比 + 模型迭代开发，瓶身管真实场景验证，互不混训。计划唯一来源 `docs/PCB_PLAN.md`。当前进度：Phase 0 完成（数据准备 + 锚框匹配率检查，决策 img_size=1024 + anchor=pcb_cand），下一步 Phase 1（config profile + dataset/model 适配 + 干净基线训练）。
+**2026-11-18 起新增 PCB 基准线（老师要求公开数据集可比性）**：PKU-Market-PCB-corrected（693 图 6 类，板级隔离划分 541/152），两条腿并行——PCB 管横向可比 + 模型迭代开发，瓶身管真实场景验证，互不混训。计划唯一来源 `docs/PCB_PLAN.md`。当前进度：Phase 0 完成、Phase 1 代码适配完成（回归全过）、**基线训练运行中**（pcb_baseline_resize1024，30 epoch）；训练完成后跑 `tools/evaluate_pcb.py` 出基线数字 + 错检分类表。
 
 ## 已完成（新增 2026-11-18）
 - **PCB 基准线 Phase 0**（详见 `docs/PCB_PLAN.md`）：
@@ -20,9 +20,33 @@
      而 xinpaide 现役 anchor 在 resize_640 下仅 0.218（RPN 会饿死）。
   3. 实测数据档案：每图 1~6 框均值 4.04（多实例）；sqrt(面积) 中位 64.9px
      p10 43.4 / p90 87.9；面积占比中位 0.0686%；10 板=10 种图尺寸
-     → dataset 必须修 per-image 尺寸（现 `_get_bboxes_in_window` 用全局
-     4096×2736，PCB 下必错）。
-  4. 未碰任何现有代码/配置（xinpaide 口径不动）；脚本纯标准库 + `-I` 隔离运行。
+     → dataset 必须修 per-image 尺寸（已修，见 Phase 1）。
+- **PCB 基准线 Phase 1（代码适配，xinpaide 口径零改动）**：
+  1. `config.py`：`dataset_profile` 字段 + `set_profile()`/`_apply_dataset_profile()`；
+     pcb 分支设 6 类直通映射、img_size 1024、preprocess=resize、max_objects=16、
+     max_dets_per_image=20、负窗不限流；新增 `max_neg_windows_per_img`/
+     `use_mosaic`/`use_random_crop_aug`/`pcb_split_json` 字段。xinpaide 默认行为不变。
+  2. `dataset.py`：`_get_bboxes_in_window` 按每图实际尺寸（修 PCB 10 板尺寸 bug）；
+     `file_list` 白名单加载；负窗限量读 config；未知类跳过计数+汇总警告；
+     resize 路径 mosaic/RandomCrop 加开关（默认关，代码保留）。
+  3. `model_fpn.py`：`FPN_CONFIG_PCB`（15 anchor/层）+ `INFERENCE_CONFIG_PCB`
+     （max_detections=20）+ `get_active_fpn_config()/get_active_inference_config()`；
+     RPN 公开 `anchor_configs` 属性；train/extract_rpn_proposals 全部改从模型实例读锚框。
+  4. `sahi_inference.py`：`MODEL_CLS_TO_NAME` 从 config.class_names 派生
+     （xinpaide 结果不变）；dy 补偿/扩张加 `dataset_profile=='xinpaide'` 守卫。
+  5. `train.py`：`--dataset pcb` / `--img-size`；PCB 板级划分 file_list 加载
+     （541/152，加载前断言无重叠）。
+  6. `tools/evaluate_pcb.py`：resize（letterbox 与训练同公式反变换）/ sahi 两模式，
+     产出 quality 契约 predictions → `quality/metrics.py` 评估 + 相对面积分档 AP。
+  7. 测试：`tests/test_pcb.py` 6 项（profile 切换/映射隔离/file_list/未知类计数/
+     per-image 尺寸回归）；**全量单测 55/55**。
+  8. **回归全过**：`smoke_ui.py` 5/5；`smoke_test.py --n 1` IoU 0.742/0.825
+     与打补丁前一致；PCB 训练链路冒烟（RPN loss 4.22 / 3200 proposals /
+     ROI 头 7 通道）通过。
+  9. **基线训练运行中**：`python train.py --dataset pcb --exp pcb_baseline_resize1024
+     --total-epochs 30`，日志 `exp_logs/pcb_baseline_resize1024.log`。
+     完成后：`tools/evaluate_pcb.py --model experiments/pcb_baseline_resize1024/models/best_model.pth`
+     → 错检分类表（Phase 1 收尾）。
 
 ## 已完成（新增 2026-10-19）
 - **多缺陷训练 PR3 v2**（交付包 `look-PR3-v2-适配最新提交-8bf0346`，opt-in，默认不影响旧训练口径）：
@@ -80,11 +104,13 @@
 - **C4** GC10DET 残余隔离收尾（P2）。
 
 ## 下一步
-1. 决定 dirty 提升方向（见上"未完成"第 1 条，建议先查标注一致性，成本最低）。
-2. 多缺陷数据集到位后：制作 manifest（按 `docs/PR2_DATA_EVAL.md` 合同）→ `tools.build_group_split` 分组划分 → 用 `train.py --manifest ... --split-json ... --data-root ...` 训练（自动 GT-aware）→ 训练后用 PR2 工具按新口径评估（multi_class_all_found_rate 等）。
-3. PR3 训练前先复核 dirty 标注一致性；GT 注入不解决 RPN 召回问题，训练后要报告 RPN recall。
-3. 如继续训练：`python train.py --exp <name>`（改动已就位）。
-4. P2 收尾项见上。
+1. **等 PCB 基线训练完成**（b0jlzyeu2，日志 exp_logs/pcb_baseline_resize1024.log）：
+   `tools/evaluate_pcb.py --model experiments/pcb_baseline_resize1024/models/best_model.pth`
+   → 记 mAP50/per-class AP → 错检分类表（类 × 尺寸档 × 失败场景）→ 定创新点。
+2. 决定 dirty 提升方向（见上"未完成"第 1 条，建议先查标注一致性，成本最低）。
+3. 多缺陷数据集到位后：制作 manifest（按 `docs/PR2_DATA_EVAL.md` 合同）→ `tools.build_group_split` 分组划分 → 用 `train.py --manifest ... --split-json ... --data-root ...` 训练（自动 GT-aware）→ 训练后用 PR2 工具按新口径评估（multi_class_all_found_rate 等）。
+4. 如继续瓶身训练：`python train.py --exp <name>`（改动已就位）。
+5. P2 收尾项见上。
 
 ## 风险（当前未解决）
 1. **dirty 偏移两极分化未解决**：非固定偏移，固定平移补偿无效（A14 已证伪）；部分 FN 是形状问题（框瘦高）而非平移。
