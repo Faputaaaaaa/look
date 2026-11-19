@@ -26,6 +26,7 @@
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -44,7 +45,10 @@ import torchvision.transforms as transforms
 
 from quality.metrics import evaluate as qm_evaluate
 from quality.metrics import _ap_all_point, _iou  # 分档 AP 复用同一插值实现
-import sahi_inference as si
+# 注意：sahi_inference 在 import 时捕获 window/img_size/类映射常量，
+# 因此延迟到 main() 里、CLI 覆盖参数生效之后再 import。
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 NORMALIZE = transforms.Normalize(
@@ -68,7 +72,7 @@ def letterbox(img: Image.Image):
     ox, oy = (size - nw) // 2, (size - nh) // 2
     canvas.paste(resized, (ox, oy))
     t = NORMALIZE(transforms.ToTensor()(canvas))
-    return t.unsqueeze(0).to(si.DEVICE), scale, ox, oy
+    return t.unsqueeze(0).to(DEVICE), scale, ox, oy
 
 
 def invert_letterbox(box, scale, ox, oy, iw, ih):
@@ -225,7 +229,23 @@ def main():
     parser.add_argument("--mode", default="resize", choices=["resize", "sahi"])
     parser.add_argument("--max-imgs", type=int, default=None, help="冒烟：只评估前 N 张")
     parser.add_argument("--out", default=None, help="评估结果 JSON 输出路径（默认 data/pcb/eval_<mode>.json）")
+    # [PCB SAHI 消融] 窗口尺寸/步长覆盖：必须在 import sahi_inference 之前生效
+    parser.add_argument("--img-size", type=int, default=None,
+                        help="覆盖 config.img_size（SAHI 模式须 == window_size，不额外缩放）")
+    parser.add_argument("--window-size", type=int, default=None,
+                        help="覆盖 config.window_size（512/640/800）")
+    parser.add_argument("--window-stride", type=int, default=None,
+                        help="覆盖 config.window_stride（窗口的一半）")
     args = parser.parse_args()
+
+    if args.img_size:
+        config.img_size = args.img_size
+    if args.window_size:
+        config.window_size = args.window_size
+    if args.window_stride:
+        config.window_stride = args.window_stride
+    # 覆盖生效后再 import（sahi 常量在 import 时捕获 config）
+    import sahi_inference as si
 
     split_path = Path(args.split_json)
     split_data = json.loads(split_path.read_text(encoding="utf-8"))
@@ -241,14 +261,17 @@ def main():
 
     data_root = Path(config.data_dir)
     predictions = []
+    infer_times = []  # 每图推理耗时（秒）
     for i, row in enumerate(rows):
         if i % 20 == 0:
             print(f"  进度: {i}/{len(rows)}")
         img = Image.open(data_root / row["path"]).convert("RGB")
+        t0 = time.perf_counter()
         if args.mode == "sahi":
             dets = infer_sahi(model, img)
         else:
             dets = infer_resize(model, img, thr=0.05)
+        infer_times.append(time.perf_counter() - t0)
         predictions.append({
             "image_id": row["image_id"],
             "detections": [
@@ -257,6 +280,14 @@ def main():
                 for box, s, c in [(d[:4], d[4], d[5]) for d in dets]
             ],
         })
+
+    vram_mb = (torch.cuda.max_memory_allocated() / 1024 ** 2
+               if torch.cuda.is_available() else None)
+    print(f"[eval] 推理耗时: 总 {sum(infer_times):.1f}s / "
+          f"每图均值 {sum(infer_times) / len(infer_times):.2f}s "
+          f"(min {min(infer_times):.2f} / max {max(infer_times):.2f})")
+    if vram_mb is not None:
+        print(f"[eval] GPU 峰值显存: {vram_mb:.0f} MB")
 
     result = qm_evaluate(manifest, predictions, iou_threshold=0.5, operating_score=0.5)
 
@@ -301,6 +332,11 @@ def main():
         "split": args.split,
         "n_images": len(rows),
         "img_size": config.img_size,
+        "window_size": config.window_size if args.mode == "sahi" else None,
+        "window_stride": config.window_stride if args.mode == "sahi" else None,
+        "infer_time_s": {"total": round(sum(infer_times), 2),
+                         "mean_per_image": round(sum(infer_times) / len(infer_times), 3)},
+        "gpu_peak_vram_mb": round(vram_mb, 0) if vram_mb is not None else None,
         "eval": result,
         "predictions": predictions,
     }

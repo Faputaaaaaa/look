@@ -25,6 +25,7 @@ from torch.utils.data import Dataset
 import torchvision.transforms as transforms
 
 from config import config
+from inference_utils import unique_sahi_windows  # [PCB] 训练窗口枚举与推理同源
 
 
 class DefectDataset(Dataset):
@@ -177,7 +178,17 @@ class DefectDataset(Dataset):
                     # 背景>缺陷会淹没RPN正样本，故每图限量（config.max_neg_windows_per_img）
                     # [PCB] 窗口内 bbox 裁剪按每图实际尺寸（PCB 有 10 种板尺寸，
                     # 不能用全局 config.original_img_*）
-                    windows, (img_w, img_h) = self._generate_windows(img_file)
+                    if config.use_unique_windows:
+                        # [PCB] 训练窗口 = 推理窗口（unique_sahi_windows 同源）：
+                        # 去重 + 贴边窗口向图像内收缩，与 sahi_inference 完全一致
+                        img = Image.open(img_file)
+                        img_w, img_h = img.size
+                        rects = unique_sahi_windows(
+                            img_w, img_h, self.window_size, self.window_stride)
+                        windows = [{'x': x1, 'y': y1, 'w': x2 - x1, 'h': y2 - y1}
+                                   for (x1, y1, x2, y2) in rects]
+                    else:
+                        windows, (img_w, img_h) = self._generate_windows(img_file)
                     pos_window_samples = []
                     neg_window_samples = []
                     for window in windows:
@@ -541,6 +552,13 @@ class DefectDataset(Dataset):
             window['x'] + window['w'],
             window['y'] + window['h']
         ))
+
+        # [PCB] 贴边窗口补灰边到 window_size（与 sahi_inference 预处理完全一致，
+        # 灰色 128 画布）。xinpaide 的窗口恒等于 window_size，此分支不触发，行为不变。
+        if img_cropped.size != (self.window_size, self.window_size):
+            padded = Image.new('RGB', (self.window_size, self.window_size), (128, 128, 128))
+            padded.paste(img_cropped, (0, 0))
+            img_cropped = padded
 
         img_resized = img_cropped.resize((self.img_size, self.img_size))
 

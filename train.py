@@ -1383,6 +1383,16 @@ def parse_args():
                         help='数据集 profile（默认 xinpaide；pcb=公开基准线，板级划分）')
     parser.add_argument('--img-size', type=int, default=None,
                         help='覆盖 config.img_size（如 PCB SAHI 消融训练时用 640）')
+    # [PCB] SAHI 消融：训练/推理同窗口同步长、不额外缩放（img_size == window_size）
+    parser.add_argument('--window-size', type=int, default=None,
+                        help='覆盖 config.window_size（PCB SAHI 消融：512/640/800）')
+    parser.add_argument('--window-stride', type=int, default=None,
+                        help='覆盖 config.window_stride（默认窗口的一半）')
+    parser.add_argument('--preprocess', type=str, default=None,
+                        choices=['resize', 'sliding_window', 'smart_crop'],
+                        help='覆盖 config.preprocess_method（PCB SAHI 消融用 sliding_window）')
+    parser.add_argument('--max-neg-windows', type=int, default=None,
+                        help='覆盖 config.max_neg_windows_per_img（-1=不限；SAHI 消融统一 2）')
     return parser.parse_args()
 
 
@@ -1407,6 +1417,19 @@ def main():
     if args.img_size:
         config.img_size = args.img_size
         print(f"[Config] img_size 覆盖为 {config.img_size}")
+    if args.window_size:
+        config.window_size = args.window_size
+        print(f"[Config] window_size 覆盖为 {config.window_size}")
+    if args.window_stride:
+        config.window_stride = args.window_stride
+        print(f"[Config] window_stride 覆盖为 {config.window_stride}")
+    if args.preprocess:
+        config.preprocess_method = args.preprocess
+        print(f"[Config] preprocess_method 覆盖为 {config.preprocess_method}")
+    if args.max_neg_windows is not None:
+        config.max_neg_windows_per_img = (
+            None if args.max_neg_windows < 0 else args.max_neg_windows)
+        print(f"[Config] max_neg_windows_per_img 覆盖为 {config.max_neg_windows_per_img}")
     if args.exp:
         # 覆盖实验名，并重新推导派生路径（__post_init__ 已在 import 时跑过）
         config.experiment_name = args.exp

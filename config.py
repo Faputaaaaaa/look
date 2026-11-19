@@ -120,6 +120,11 @@ class Config:
     # xinpaide 历史硬编码 2（dataset.py），现配置化；PCB 干净基线= None（不限）。
     max_neg_windows_per_img: Optional[int] = 2
 
+    # [PCB] 训练窗口枚举是否用 unique_sahi_windows（与推理同口径：去重 + 贴边覆盖）。
+    # xinpaide 默认 False（历史 _generate_windows 含边界重复窗口，行为不变）；
+    # PCB SAHI 训练必须 True——训练/推理窗口集合一致，消融才干净。
+    use_unique_windows: bool = False
+
     # [PCB] resize 路径的增强开关（默认关；xinpaide 走滑动窗口路径不经过）。
     # mosaic/RandomCrop 违反项目「只保留水平翻转」规则，代码路径保留但默认禁用。
     use_mosaic: bool = False
@@ -280,6 +285,7 @@ class Config:
             self.original_img_width = 3056
             self.original_img_height = 2464
             self.max_neg_windows_per_img = None  # 干净基线不限背景窗
+            self.use_unique_windows = True  # SAHI 训练与推理窗口集合一致
             self.use_mosaic = False
             self.use_random_crop_aug = False
             # 训练/验证用同一组目录，划分靠 file_list（板级隔离，防泄漏）
