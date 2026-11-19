@@ -164,10 +164,12 @@ def build_manifest(split_data, split_name):
     return {"classes": classes, "images": images}
 
 
-def bin_ap(manifest, pred_by_image, cls, lo, hi):
-    """某个 (类别 × 面积档) 的 AP50：只匹配档内 GT（其余 GT 视为不存在）。
+def bin_stats(manifest, pred_by_image, cls, lo, hi, op=0.5):
+    """某个 (类别 × 面积档) 的统计：n_gt / recall@op / AP50。
 
-    复用 quality/metrics.py 的插值实现；bbox 面积占比用 manifest 里 image 宽高算。
+    只匹配档内 GT（其余 GT 视为不存在）。注意：AP50 用共用预测池
+    （COCO per-area 语义）——匹配档外 GT 的预测在这里记 FP，跨档竞争
+    会压低各档 AP，因此 recall@op 是分档表的主读数，AP 是辅助列。
     """
     from collections import defaultdict
 
@@ -187,24 +189,31 @@ def bin_ap(manifest, pred_by_image, cls, lo, hi):
         gt[row["image_id"]] = boxes
         n_pos += len(boxes)
     if n_pos == 0:
-        return None
-    all_preds = sorted(
-        ((d["confidence"], image_id, d["bbox"])
-         for image_id, dets in pred_by_image.items()
-         for d in dets if d["class_name"] == cls),
-        key=lambda x: -x[0])  # 置信度降序（与 quality/metrics._match_class 同口径）
-    matched = defaultdict(set)
-    tps, fps = [], []
-    for _conf, image_id, box in all_preds:
-        options = [(_iou(box, g), j)
-                   for j, g in enumerate(gt[image_id]) if j not in matched[image_id]]
-        best = max(options, default=(0.0, -1))
-        ok = best[1] >= 0 and best[0] >= 0.5
-        if ok:
-            matched[image_id].add(best[1])
-        tps.append(int(ok))
-        fps.append(int(not ok))
-    return _ap_all_point(tps, fps, n_pos)
+        return {"n_gt": 0, "recall_op": None, "ap": None}
+
+    def _match(score_floor):
+        matched = defaultdict(set)
+        tps, fps = [], []
+        for _conf, image_id, box in sorted(
+                ((d["confidence"], image_id, d["bbox"])
+                 for image_id, dets in pred_by_image.items()
+                 for d in dets if d["class_name"] == cls and d["confidence"] >= score_floor),
+                key=lambda x: -x[0]):
+            options = [(_iou(box, g), j)
+                       for j, g in enumerate(gt[image_id]) if j not in matched[image_id]]
+            best = max(options, default=(0.0, -1))
+            ok = best[1] >= 0 and best[0] >= 0.5
+            if ok:
+                matched[image_id].add(best[1])
+            tps.append(int(ok))
+            fps.append(int(not ok))
+        return matched, tps, fps
+
+    matched_op, tps_op, fps_op = _match(op)
+    matched_raw, tps_raw, fps_raw = _match(0.0)
+    recall_op = sum(len(v) for v in matched_op.values()) / n_pos
+    ap = _ap_all_point(tps_raw, fps_raw, n_pos)
+    return {"n_gt": n_pos, "recall_op": recall_op, "ap": ap}
 
 
 def main():
@@ -269,16 +278,19 @@ def main():
           f"R={result['micro_recall']:.4f}")
     print(f"{'='*72}")
 
-    # ---- 相对面积分档（不硬套 COCO AP_small） ----
+    # ---- 相对面积分档（不硬套 COCO AP_small；主读数是 recall@op，AP 为辅助） ----
     pred_by_image = {p["image_id"]: p["detections"] for p in predictions}
-    print(f"\n相对面积分档 AP50（按缺陷面积占图比例）")
-    header = f"{'class':<16}" + "".join(f"{name:>18}" for name, _, _ in SIZE_BINS)
+    print(f"\n相对面积分档（操作点 conf>=0.5；格式 = n_gt / recall@op / AP50）")
+    header = f"{'class':<16}" + "".join(f"{name:>26}" for name, _, _ in SIZE_BINS)
     print(header)
     for cls in split_data["classes"]:
         line = f"{cls:<16}"
         for name, lo, hi in SIZE_BINS:
-            ap = bin_ap(manifest, pred_by_image, cls, lo, hi)
-            line += f"{ap:>18.4f}" if ap is not None else f"{'-':>18}"
+            s = bin_stats(manifest, pred_by_image, cls, lo, hi)
+            if s["ap"] is None:
+                line += f"{'-':>26}"
+            else:
+                line += f"{s['n_gt']:>4} / {s['recall_op']:>5.2f} / {s['ap']:>6.3f}".rjust(26)
         print(line)
 
     # ---- 落盘 ----

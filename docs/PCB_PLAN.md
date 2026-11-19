@@ -99,12 +99,38 @@
 
 ## 5. 协议纪律（每阶段必守）
 
+### 5.1 评估协议（2026-11-19 审计核定）
+
+三要素已做一致性审计并数值验证：
+
+1. **预测生成（训练↔评估一致）**：resize 模式 = letterbox（scale=min(S/iw,S/ih)、
+   BILINEAR、灰 128 画布）+ ImageNet 归一化——与训练 `dataset._process_resize`
+   **逐像素一致（已数值验证 0 差）**；推理走 `model.inference` 单一路径
+   （内部 score>0.1 硬过滤 = 有效置信度 floor；class-aware NMS 0.30；
+   PCB max_detections=20）。
+2. **评估指标**：`quality/metrics.py`（IoU@0.5 类别感知多实例匹配 +
+   VOC all-point AP，锚定 recall=0）+ op=0.5 的 P/R + micro P/R。
+   两种 AP 实现（quality/metrics vs sahi_inference.voc_ap）**数值一致
+   （已用真实预测验证，差 <1e-16）**。分档表主读数 = **recall@op**
+   （n_gt / recall / AP 三列；AP 为共用预测池语义，跨档竞争会压低它，勿单看）。
+3. **checkpoint 选择**：训练期按 val loss 存 best（train.py validate()，
+   与训练同管线）；**评估时必须对 best 与 latest 都跑，报告 val-mAP 更高者**
+   （当前基线：best=0.3006 > latest=0.2969，best 即 min-val-loss 点）。
+   若 Phase 2 启用训练中 mAP 选模型，必须为 PCB 另写验证器——**禁止**用
+   xinpaide 的 `run_val_metrics`（滑窗口口径，与 resize 基线不可比）。
+4. **确定性**：eval 时 model.eval()（Dropout 关）；本分支未开
+   cudnn.benchmark。重跑复现：mAP 与每类 AP 逐位一致（已验证）。
+5. **纪律**：val 只跑定版评估；日常迭代用 dev 板（板 01 从 train 留出）；
+   评估产物落盘 `data/pcb/eval_<mode>.json`（含全部预测，可复核）。
+
+### 5.2 通用纪律
+
 - dev/val 分离：日常迭代用 train 里留出的板（建议板 01）当 dev；**val（板
   10/11/12）只在定版时跑一次**写进论文。
 - 操作阈值纪律：在 dev/val 上选固定置信度阈值 → 独立测试集量误报/漏检
   （`quality/metrics.py` 的 `operating_score` 就是干这个的）。
 - 每阶段收尾：git commit + 更新 HANDOFF/STATUS + `config.save_config()` 快照。
-- 运行环境：`D:\Python3.14\python.exe`；数据脚本用 `-I` 隔离模式。
+- 运行环境：`D:\Python3.14\python.exe`；纯数据脚本用 `-I` 隔离模式。
 
 ## 6. 交付物清单（论文素材）
 
