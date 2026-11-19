@@ -8,10 +8,10 @@
   重跑同一命令即从断点继续，不需要人工介入。
 
 启动（独立进程，等价 Windows 版 nohup）：
-    cmd /c start /min "" D:\\Python3.14\\python.exe tools\\run_pcb_sahi_chain.py
+    cmd /c start /min "" D:\\Python3.14\\python.exe tools\\run_pcb_sahi_chain.py --epochs 10
 
 前台调试：
-    D:/Python3.14/python.exe tools/run_pcb_sahi_chain.py --only 512
+    D:/Python3.14/python.exe tools/run_pcb_sahi_chain.py --only 512 --epochs 10
 """
 
 import argparse
@@ -30,7 +30,7 @@ CONFIGS = [
     {"tag": "w800", "size": 800, "stride": 400},
 ]
 
-TOTAL_EPOCHS = 30  # 与 resize 基线统一（docs/PCB_PLAN.md 消融矩阵口径）
+TOTAL_EPOCHS = 30  # 默认（确认轮与基线同口径）；探索轮用 --epochs 10
 
 
 def log(msg):
@@ -41,22 +41,17 @@ def log(msg):
         f.write(line + "\n")
 
 
-def run_one(cfg):
+def run_one(cfg, total_epochs):
     exp = f"pcb_sahi_{cfg['tag']}"
     exp_dir = ROOT / "experiments" / exp
     latest = exp_dir / "models" / "latest.pth"
     log_path = ROOT / "exp_logs" / f"pcb_sahi_{cfg['tag']}.log"
 
-    if log_path.exists() and "训练完成总结" in log_path.read_text(
-            encoding="utf-8", errors="ignore"):
-        log(f"{exp}: 已完成（日志含完成标记），跳过")
-        return 0
-
     cmd = [
         sys.executable, str(ROOT / "train.py"),
         "--dataset", "pcb",
         "--exp", exp,
-        "--total-epochs", str(TOTAL_EPOCHS),
+        "--total-epochs", str(total_epochs),
         "--img-size", str(cfg["size"]),
         "--window-size", str(cfg["size"]),
         "--window-stride", str(cfg["stride"]),
@@ -64,10 +59,20 @@ def run_one(cfg):
         "--max-neg-windows", "2",
     ]
     if latest.exists():
+        # 从 checkpoint 读已完成 epoch 数（比解析日志可靠；10/30 两轮互不误跳）
+        import torch
+        try:
+            ck = torch.load(latest, map_location="cpu", weights_only=False)
+            done_epochs = int(ck.get("epoch", 0))
+        except Exception:
+            done_epochs = 0
+        if done_epochs >= total_epochs:
+            log(f"{exp}: 已到 {done_epochs} epoch（≥ {total_epochs}），跳过")
+            return 0
         cmd += ["--resume", str(latest)]
-        log(f"{exp}: 发现 latest.pth，断点续训")
+        log(f"{exp}: 从 epoch {done_epochs} 续训（目标 {total_epochs}）")
     else:
-        log(f"{exp}: 全新训练")
+        log(f"{exp}: 全新训练（目标 {total_epochs} epoch）")
 
     env = dict(os.environ)
     env["PYTHONUTF8"] = "1"  # 日志 UTF-8 可读（避免 GBK 乱码）
@@ -88,14 +93,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--only", default=None,
                         help="逗号分隔，只跑指定档（512,640,800）")
+    parser.add_argument("--epochs", type=int, default=TOTAL_EPOCHS,
+                        help=f"每档目标 epoch 数（默认 {TOTAL_EPOCHS}；探索轮用 10）")
     args = parser.parse_args()
     configs = CONFIGS
     if args.only:
         want = {int(x) for x in args.only.split(",")}
         configs = [c for c in CONFIGS if c["size"] in want]
-    log(f"训练链开始（{len(configs)} 档，{TOTAL_EPOCHS} epoch/档）")
+    log(f"训练链开始（{len(configs)} 档，{args.epochs} epoch/档）")
     for cfg in configs:
-        run_one(cfg)
+        run_one(cfg, args.epochs)
     log("训练链全部结束")
 
 
