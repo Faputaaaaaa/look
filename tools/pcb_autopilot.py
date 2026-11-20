@@ -45,17 +45,17 @@ def log(msg):
 
 
 def ckpt_epoch(exp):
-    """读 latest.pth 的 epoch 数（不存在返回 0）。"""
+    """读 latest.pth 的 epoch 字段（0 基 = 已完成 epoch 数 - 1），不存在返回 -1。"""
     p = ROOT / "experiments" / exp / "models" / "latest.pth"
     if not p.exists():
-        return 0
+        return -1
     try:
         import torch
         ck = torch.load(p, map_location="cpu", weights_only=False)
         return int(ck.get("epoch", 0))
     except Exception as e:
         log(f"  [warn] 读 {exp} checkpoint 失败: {e}")
-        return 0
+        return -1
 
 
 def wait_chain_done(timeout_h=44):
@@ -63,14 +63,15 @@ def wait_chain_done(timeout_h=44):
     log(f"等待探索链完成（3 档 × {EXPLORE_EPOCHS} epoch，超时 {timeout_h}h）")
     deadline = time.time() + timeout_h * 3600
     while time.time() < deadline:
-        states = {s: ckpt_epoch(f"pcb_sahi_w{s}") for s in SIZES}
+        # epoch 字段 0 基：完成 N 个 epoch 时字段 = N-1
+        states = {s: ckpt_epoch(f"pcb_sahi_w{s}") + 1 for s in SIZES}
         log("  进度: " + " ".join(f"w{s}={e}ep" for s, e in states.items()))
         if all(e >= EXPLORE_EPOCHS for e in states.values()):
             log("探索链全部完成")
             return states
         time.sleep(900)  # 15 分钟一轮
     log("[FAIL] 等待超时；按当前 checkpoint 状态继续（未完成的档评估会失败）")
-    return {s: ckpt_epoch(f"pcb_sahi_w{s}") for s in SIZES}
+    return {s: ckpt_epoch(f"pcb_sahi_w{s}") + 1 for s in SIZES}
 
 
 def run_eval(size, model_name, model_path, out_path):
@@ -126,9 +127,9 @@ def eval_both(exp_tag, size, out_prefix):
 
 
 def train(size, epochs, exp, seed=None, resume_ok=True):
-    """训练一次，返回退出码。resume_ok 且 epoch<目标 时自动 --resume。"""
+    """训练一次，返回退出码。resume_ok 且完成 epoch<目标 时自动 --resume。"""
     latest = ROOT / "experiments" / exp / "models" / "latest.pth"
-    done = ckpt_epoch(exp)
+    done = ckpt_epoch(exp) + 1  # 已完成 epoch 数（字段 0 基）
     cmd = [sys.executable, str(ROOT / "train.py"),
            "--dataset", "pcb", "--exp", exp,
            "--total-epochs", str(epochs),
@@ -138,7 +139,7 @@ def train(size, epochs, exp, seed=None, resume_ok=True):
     if seed is not None:
         cmd += ["--seed", str(seed)]
     if done >= epochs:
-        log(f"训练 {exp}: 已到 {done} epoch（≥ {epochs}），跳过")
+        log(f"训练 {exp}: 已完成 {done} epoch（≥ {epochs}），跳过")
         return 0
     if resume_ok and latest.exists():
         cmd += ["--resume", str(latest)]

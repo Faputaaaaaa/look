@@ -59,11 +59,11 @@ def run_one(cfg, total_epochs):
         "--max-neg-windows", "2",
     ]
     if latest.exists():
-        # 从 checkpoint 读已完成 epoch 数（比解析日志可靠；10/30 两轮互不误跳）
+        # 从 checkpoint 读已完成 epoch 数（字段 0 基：完成 N 个 epoch 时 = N-1）
         import torch
         try:
             ck = torch.load(latest, map_location="cpu", weights_only=False)
-            done_epochs = int(ck.get("epoch", 0))
+            done_epochs = int(ck.get("epoch", 0)) + 1
         except Exception:
             done_epochs = 0
         if done_epochs >= total_epochs:
