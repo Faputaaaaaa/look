@@ -2,7 +2,16 @@
 
 > 快速一览，细节见 HANDOFF.md。
 
-## 最新状态（2026-11-19）
+## 最新状态（2026-11-20）
+- **SAHI 窗口消融探索轮进行中**（`tools/run_pcb_sahi_chain.py --epochs 10`，独立进程，断点自愈）：
+  - w512 ✅ 完成（9.4h，best_loss 1.83）；w640 ⏳ 运行中（预计 11-20 傍晚）；
+    w800 排队（预计 11-21 凌晨）。
+  - **决策（2026-11-20）**：评估统一推迟到链全部结束后一次跑三档
+    （会话后台任务会被内存回收杀——已发生 3 次；训练链走独立进程不受影响）。
+    链完成后依次执行：
+    `python -m tools.evaluate_pcb --mode sahi --img-size S --window-size S --window-stride S/2 --model experiments/pcb_sahi_w<S>/models/best_model.pth --out data/pcb/eval_sahi_w<S>.json`
+    （S=512/640/800；best 与 latest 都跑，按审计协议报 val-mAP 更高者）
+  - 实测每 epoch ~56 min（数据加载瓶颈，非 GPU）；探索轮总时长 ~30h。
 - **PCB 基线 mAP50 = 0.3006 已出**（resize_1024 + pcb_cand anchor，30 epoch，val 152 图）：
   - 每类 AP50：missing_hole 0.620 / open_circuit 0.457 / short 0.424 /
     spurious_copper 0.192 / mouse_bite 0.086 / spur 0.025。
