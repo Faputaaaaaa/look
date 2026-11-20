@@ -137,6 +137,9 @@ def infer_resize(model, img: Image.Image, thr):
 
 def infer_sahi(model, img: Image.Image):
     """SAHI 模式单图推理 → [(x1,y1,x2,y2,score,cls_name)] 原图坐标（平台同口径）。"""
+    # 惰性 import：sahi 常量在首次 import 时捕获 config，而 main() 会在
+    # CLI 覆盖（--img-size/--window-size/--window-stride）之后先 import 一次。
+    import sahi_inference as si
     dets = si.sahi_inference_image(model, img, max_dets=config.max_dets_per_image)
     return [(x1, y1, x2, y2, s, config.class_names[c - 1]) for x1, y1, x2, y2, s, c in dets]
 
