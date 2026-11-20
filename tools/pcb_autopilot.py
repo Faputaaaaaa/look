@@ -58,9 +58,16 @@ def ckpt_epoch(exp):
         return -1
 
 
-def wait_chain_done(timeout_h=44):
-    """等三档 10-epoch 探索全部完成（按 checkpoint epoch 判定）。"""
+def wait_chain_done(timeout_h=40):
+    """等三档 10-epoch 探索全部完成（按 checkpoint epoch 判定）。
+
+    终止条件（满足其一）：
+    1. 三档 checkpoint epoch 都 ≥ EXPLORE_EPOCHS；
+    2. 链进程已结束（链日志含「训练链全部结束」或某档「退出码」）——
+       此时按当前 checkpoint 状态继续，未完成的档评估会失败并记入 summary。
+    """
     log(f"等待探索链完成（3 档 × {EXPLORE_EPOCHS} epoch，超时 {timeout_h}h）")
+    chain_log = ROOT / "exp_logs" / "pcb_sahi_chain.log"
     deadline = time.time() + timeout_h * 3600
     while time.time() < deadline:
         # epoch 字段 0 基：完成 N 个 epoch 时字段 = N-1
@@ -68,6 +75,11 @@ def wait_chain_done(timeout_h=44):
         log("  进度: " + " ".join(f"w{s}={e}ep" for s, e in states.items()))
         if all(e >= EXPLORE_EPOCHS for e in states.values()):
             log("探索链全部完成")
+            return states
+        text = (chain_log.read_text(encoding="utf-8", errors="ignore")
+                if chain_log.exists() else "")
+        if "训练链全部结束" in text or "pcb_sahi_w800: 退出码" in text:
+            log("链进程已结束（可能含失败档），按当前 checkpoint 状态继续")
             return states
         time.sleep(900)  # 15 分钟一轮
     log("[FAIL] 等待超时；按当前 checkpoint 状态继续（未完成的档评估会失败）")
