@@ -1393,6 +1393,8 @@ def parse_args():
                         help='覆盖 config.preprocess_method（PCB SAHI 消融用 sliding_window）')
     parser.add_argument('--max-neg-windows', type=int, default=None,
                         help='覆盖 config.max_neg_windows_per_img（-1=不限；SAHI 消融统一 2）')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='覆盖 config.seed（多随机种子稳定性实验）')
     return parser.parse_args()
 
 
@@ -1430,6 +1432,9 @@ def main():
         config.max_neg_windows_per_img = (
             None if args.max_neg_windows < 0 else args.max_neg_windows)
         print(f"[Config] max_neg_windows_per_img 覆盖为 {config.max_neg_windows_per_img}")
+    if args.seed is not None:
+        config.seed = args.seed
+        print(f"[Config] seed 覆盖为 {config.seed}")
     if args.exp:
         # 覆盖实验名，并重新推导派生路径（__post_init__ 已在 import 时跑过）
         config.experiment_name = args.exp
