@@ -121,13 +121,14 @@ def run_eval(size, model_name, model_path, out_path):
 def eval_both(exp_tag, size, out_prefix):
     """按审计协议：best/latest 都评估，报 val-mAP 更高者。
 
-    exp_tag: 实验后缀（如 'w512' / 'w640_s2'）；out_prefix: 结果 JSON 前缀。
+    exp_tag: 实验后缀（如 'w512' / 'w800_s2'）；out_prefix: 结果 JSON 前缀。
+    注：checkpoint 实际文件名是 best_model.pth / latest.pth（后缀不同）。
     """
     exp = f"pcb_sahi_{exp_tag}"
     base = ROOT / "experiments" / exp / "models"
     entries = []
-    for name in ("best", "latest"):
-        p = base / f"{name}_model.pth"
+    for name, ckpt_name in (("best", "best_model.pth"), ("latest", "latest.pth")):
+        p = base / ckpt_name
         if not p.exists():
             continue
         mAP, jp = run_eval(size, name, p, ROOT / "data" / "pcb" / f"{out_prefix}_{name}.json")

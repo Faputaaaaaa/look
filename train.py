@@ -272,12 +272,20 @@ def freeze_backbone(model: TwoStageDetector) -> None:
 
 
 def unfreeze_backbone(model: TwoStageDetector) -> None:
-    """解冻backbone（layer2, layer3）。"""
+    """解冻backbone（layer2, layer3）；layer1 保持冻结。
+
+    [C3-fix] 显式重建 layer1 冻结状态：正常训练时 layer1 在阶段1已被冻结
+    （此处重设无副作用）；但 --resume 跨阶段续训时模型从未经过阶段1，
+    layer1 仍是可训练状态，若不重建，阶段2优化器的参数组会比 checkpoint
+    存档时多出 layer1 → load_state_dict 报「parameter group 不匹配」。
+    """
+    for param in model.layer1.parameters():
+        param.requires_grad = False  # [C3-fix] resume 跨 stage 时重建冻结状态
     for param in model.layer2.parameters():
         param.requires_grad = True
     for param in model.layer3.parameters():
         param.requires_grad = True
-    
+
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"\n[阶段2] Layer2, Layer3已解冻")
@@ -1289,10 +1297,15 @@ def train_model(train_loader, val_loader, model, epochs=None, resume_ckpt=None,
             optimizer, scheduler = _build_optimizer_scheduler(model, stage)
             # [C3] resume：仅当 checkpoint 记录的 stage == 当前 stage 时恢复 optimizer + scheduler
             if resume_ckpt is not None and resume_ckpt.get('stage') == stage:
-                optimizer.load_state_dict(resume_ckpt['optimizer_state_dict'])
-                if resume_ckpt.get('scheduler_state_dict'):
-                    scheduler.load_state_dict(resume_ckpt['scheduler_state_dict'])
-                print(f"[Resume] 已恢复阶段{stage} optimizer + scheduler 状态")
+                try:
+                    optimizer.load_state_dict(resume_ckpt['optimizer_state_dict'])
+                    if resume_ckpt.get('scheduler_state_dict'):
+                        scheduler.load_state_dict(resume_ckpt['scheduler_state_dict'])
+                    print(f"[Resume] 已恢复阶段{stage} optimizer + scheduler 状态")
+                except ValueError as e:
+                    # [C3-fix] 兜底：结构不匹配时重建优化器（动量清零，模型权重保留）
+                    print(f"[Resume] 优化器状态结构不匹配，重建优化器"
+                          f"（动量清零，权重保留）: {e}")
             current_stage = stage
 
         try:
