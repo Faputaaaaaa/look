@@ -70,6 +70,11 @@ def main():
              ROOT / "data" / "pcb" / "eval_sahi_w800_probe960.json")
     run_eval("probe_1120", BASE / "best_model.pth", 1120, 560,
              ROOT / "data" / "pcb" / "eval_sahi_w800_probe1120.json")
+    # 3. 窗口探针扩展（latest 权重——协议最优模型，800 窗口下 0.7403）
+    run_eval("probe_960_latest", BASE / "latest.pth", 960, 480,
+             ROOT / "data" / "pcb" / "eval_sahi_w800_probe960_latest.json")
+    run_eval("probe_1120_latest", BASE / "latest.pth", 1120, 560,
+             ROOT / "data" / "pcb" / "eval_sahi_w800_probe1120_latest.json")
     log("确认轮评估 + 窗口探针全部结束")
 
 
