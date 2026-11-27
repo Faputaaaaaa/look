@@ -1,0 +1,31 @@
+{
+  "started": "2026-11-20T17:41:08",
+  "steps": {},
+  "chain_state": {
+    "512": 10,
+    "640": 10,
+    "800": 10
+  },
+  "explore_eval": {
+    "512": {
+      "mAP50": 0.5858,
+      "json": "D:\\deeplearning\\learn\\项目\\data\\pcb\\eval_sahi_w512_best.json"
+    },
+    "640": {
+      "mAP50": 0.6293,
+      "json": "D:\\deeplearning\\learn\\项目\\data\\pcb\\eval_sahi_w640_best.json"
+    },
+    "800": {
+      "mAP50": 0.6759,
+      "json": "D:\\deeplearning\\learn\\项目\\data\\pcb\\eval_sahi_w800_best.json"
+    }
+  },
+  "winner": 800,
+  "confirm_train_rc": 1,
+  "seed2_train_rc": 0,
+  "seed2_eval": {
+    "mAP50": 0.6339,
+    "json": "D:\\deeplearning\\learn\\项目\\data\\pcb\\eval_sahi_w800_s2_best.json"
+  },
+  "finished": "2026-11-21T10:16:33"
+}
