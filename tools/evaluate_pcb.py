@@ -239,6 +239,8 @@ def main():
                         help="覆盖 config.window_size（512/640/800）")
     parser.add_argument("--window-stride", type=int, default=None,
                         help="覆盖 config.window_stride（窗口的一半）")
+    parser.add_argument("--nms-thresh", type=float, default=None,
+                        help="覆盖 PCB 推理 NMS 阈值（密集缺陷消融；默认 0.30）")
     args = parser.parse_args()
 
     if args.img_size:
@@ -247,6 +249,12 @@ def main():
         config.window_size = args.window_size
     if args.window_stride:
         config.window_stride = args.window_stride
+    if args.nms_thresh is not None:
+        # model.inference 动态读 INFERENCE_CONFIG_PCB；sahi 全局 NMS 在下方
+        # import 时捕获（get_active_inference_config），改后两者同步生效
+        from model_fpn import INFERENCE_CONFIG_PCB
+        INFERENCE_CONFIG_PCB['nms_thresh'] = args.nms_thresh
+        print(f"[eval] NMS 阈值覆盖为 {args.nms_thresh}")
     # 覆盖生效后再 import（sahi 常量在 import 时捕获 config）
     import sahi_inference as si
 

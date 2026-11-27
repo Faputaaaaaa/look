@@ -19,7 +19,7 @@ import torchvision.transforms as transforms
 from torchvision.ops import nms
 
 from config import config
-from model_fpn import TwoStageDetector, FPN_CONFIG, INFERENCE_CONFIG
+from model_fpn import TwoStageDetector, FPN_CONFIG, INFERENCE_CONFIG, get_active_inference_config
 from dataset import DefectDataset
 from inference_utils import unique_sahi_windows
 
@@ -50,7 +50,9 @@ WINDOW = config.window_size   # 640
 STRIDE = config.window_stride # 320
 IMG_SIZE = config.img_size    # 640
 SCORE_THRESH = INFERENCE_CONFIG['score_thresh']  # 0.10
-NMS_THRESH = INFERENCE_CONFIG['nms_thresh']     # 0.30
+# [PCB] 全局 NMS 阈值按 profile 取（pcb 消融可通过 INFERENCE_CONFIG_PCB 覆盖；
+# xinpaide 默认 0.30 行为不变）
+NMS_THRESH = get_active_inference_config()['nms_thresh']
 MAX_DET = INFERENCE_CONFIG['max_detections']    # 5
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
